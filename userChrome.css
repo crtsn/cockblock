@@ -1,0 +1,5 @@
+#leechblockng_proginosko_com-browser-action { visibility: collapse; }
+/* #unified-extensions-button { visibility: hidden; } */
+#appMenu-extensions-themes-button { visibility: collapse; }
+#appMenu-empty-profiles-button { visibility: collapse; }
+#PanelUI-fxa-menu-empty-profiles-button { visibility: collapse; }

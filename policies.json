@@ -1,0 +1,13 @@
+{
+ "policies": {
+   "BlockAboutAddons": true,
+   "BlockAboutProfiles": true,
+   "DisablePrivateBrowsing": true,
+   "Extensions": {
+      "Locked":  ["leechblockng@proginosko.com"]
+    },
+    "WebsiteFilter": {
+      "Block": ["moz-extension://a78dda6d-4aee-4671-9047-e541d437ae1e/options.html"]
+    }
+ }
+}

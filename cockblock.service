@@ -1,0 +1,12 @@
+[Unit]
+Description=Foo
+
+[Service]
+EnvironmentFile=/etc/default/cockblock
+WorkingDirectory=${WORK_DIR}
+ExecStart=/usr/bin/python3 ${SCRIPT_DIR}
+RuntimeMaxSec=30s
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
