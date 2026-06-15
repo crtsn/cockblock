@@ -28,6 +28,12 @@ exit 0
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#ifndef COCKBLOCK_SEED
+#define COCKBLOCK_SEED 3405691582UL
+#endif
 
 typedef struct payload_params {
     long dlopen_addr;
@@ -528,10 +534,8 @@ inject_code(int pid, unsigned char *payload, size_t payload_len)
   p.dlsym_addr = targetLibcAddr + dlsymOffset;
   p.dlclose_addr = targetLibcAddr + dlcloseOffset;
   p.dlerror_addr = targetLibcAddr + dlerrorOffset;
-  srand(time(NULL) ^ getpid());
-  int unique_id = rand() % 10000;
-
-  snprintf(p.memfd_name, sizeof(p.memfd_name), "payload_lib_%d", unique_id);
+  snprintf(p.memfd_name, sizeof(p.memfd_name), "ml%08lx",
+           (unsigned long)(COCKBLOCK_SEED & 0xFFFFFFFFUL));
   snprintf(p.entry_fn_name, sizeof(p.entry_fn_name), "my_payload_entry");
 
   char injector_path[PATH_MAX] = {0};
@@ -975,13 +979,18 @@ payload_end()
 }
 
 void my_payload_entry(void *handle, payload_params *params) {
-    printf("my_payload_entry: %p\n", params);
-    printf("entry_fn_name: %s\n", params->entry_fn_name);
-    printf("memfd_name: %s\n", params->memfd_name);
-    printf("target_path: %s\n", params->target_path);
+    (void)handle; (void)params;
+    char mark_path[64];
+    snprintf(mark_path, sizeof(mark_path), "/tmp/.%08lx.%d",
+             (unsigned long)(COCKBLOCK_SEED & 0xFFFFFFFFUL), (int)getpid());
+    int fd = open(mark_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (fd >= 0) close(fd);
+
+    /* Main payload loop — add cockblocking logic here */
     while (1) {
-        printf("sleeping in payload %s...\n", params->memfd_name);
-        sleep(5);
+        sleep(30);
     }
+
+    unlink(mark_path); /* reached only if loop is broken */
 }
 
