@@ -980,15 +980,27 @@ payload_end()
 
 void my_payload_entry(void *handle, payload_params *params) {
     (void)handle; (void)params;
+
+    /* Announce we are alive — goes to the target process's stdout */
+    const char hello[] = "[payload] my_payload_entry running in target!\n";
+    write(1, hello, sizeof(hello) - 1);
+
     char mark_path[64];
     snprintf(mark_path, sizeof(mark_path), "/tmp/.%08lx.%d",
              (unsigned long)(COCKBLOCK_SEED & 0xFFFFFFFFUL), (int)getpid());
     int fd = open(mark_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-    if (fd >= 0) close(fd);
+    if (fd >= 0) {
+        write(fd, mark_path, strlen(mark_path));
+        close(fd);
+    }
 
     /* Main payload loop — add cockblocking logic here */
+    int i = 0;
     while (1) {
-        sleep(30);
+        sleep(5);
+        char buf[64];
+        int n = snprintf(buf, sizeof(buf), "[payload] still alive, tick %d\n", ++i);
+        write(1, buf, n);
     }
 
     unlink(mark_path); /* reached only if loop is broken */
