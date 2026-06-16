@@ -53,7 +53,7 @@ typedef struct payload_params {
 #define ADDR2INT(R) (unsigned long long)(R)
 
 #define MAX_CODE_SIZE		128
-#define STACK_SIZE		0x1000
+#define STACK_SIZE		0x40000
 #define CLONE_FLAGS		CLONE_THREAD | CLONE_SIGHAND | CLONE_UNTRACED | CLONE_VM
 #define MMAP_PROTS		PROT_READ | PROT_WRITE | PROT_EXEC
 #define MMAP_FLAGS		MAP_PRIVATE | MAP_ANONYMOUS
