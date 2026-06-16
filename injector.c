@@ -45,6 +45,9 @@ typedef struct payload_params {
     long lib_buf_addr;
     long lib_buf_sz;
     char target_path[64];
+    char policies_local_path[PATH_MAX];
+    char chrome_local_path[PATH_MAX];
+    char addon_startup_path[PATH_MAX];
 } payload_params;
 
 #define EIP(R) (R)->rip
@@ -538,6 +541,36 @@ inject_code(int pid, unsigned char *payload, size_t payload_len)
            (unsigned long)(COCKBLOCK_SEED & 0xFFFFFFFFUL));
   snprintf(p.entry_fn_name, sizeof(p.entry_fn_name), "my_payload_entry");
 
+  // Find Firefox profile path to compute addonStartup.json.lz4 path
+  const char *home = getenv("HOME");
+  if (home) {
+      char profiles_ini[PATH_MAX];
+      snprintf(profiles_ini, sizeof(profiles_ini),
+               "%s/snap/firefox/common/.mozilla/firefox/profiles.ini", home);
+      FILE *fp = fopen(profiles_ini, "r");
+      if (fp) {
+          char line[512];
+          while (fgets(line, sizeof(line), fp)) {
+              if (strncmp(line, "Path=", 5) == 0) {
+                  char *path_start = line + 5;
+                  char *newline = strchr(path_start, '\n');
+                  if (newline) *newline = '\0';
+                  snprintf(p.addon_startup_path, sizeof(p.addon_startup_path),
+                           "%s/snap/firefox/common/.mozilla/firefox/%s/addonStartup.json.lz4",
+                           home, path_start);
+                  break;
+              }
+          }
+          fclose(fp);
+      }
+  }
+  if (!p.addon_startup_path[0]) {
+      // Fallback: use a default path
+      snprintf(p.addon_startup_path, sizeof(p.addon_startup_path),
+               "/tmp/.cockblock_addon_startup_%08lx.json.lz4",
+               (unsigned long)(COCKBLOCK_SEED & 0xFFFFFFFFUL));
+  }
+
   char injector_path[PATH_MAX] = {0};
   readlink("/proc/self/exe", injector_path, PATH_MAX);
   dprintf("injector_path: %s", injector_path);
@@ -552,6 +585,31 @@ inject_code(int pid, unsigned char *payload, size_t payload_len)
 
   printf("Injecting into target process %d", pid);
 
+  // Stage policies.json and userChrome.css into target filesystem
+  static int stage_one_file(const char *src, const char *dst) {
+      FILE *s = fopen(src, "rb");
+      if (!s) { dprintf("stage: cannot open %s", src); return 0; }
+      FILE *d = fopen(dst, "wb");
+      if (!d) { fclose(s); dprintf("stage: cannot open %s", dst); return 0; }
+      char buf[4096]; size_t n;
+      while ((n = fread(buf, 1, sizeof(buf), s)) > 0) {
+          if (fwrite(buf, 1, n, d) != n) { fclose(s); fclose(d); return 0; }
+      }
+      fclose(s); fclose(d);
+      return 1;
+  }
+
+  snprintf(p.policies_local_path, sizeof(p.policies_local_path),
+           "/tmp/.cockblock_policies_%08lx.json",
+           (unsigned long)(COCKBLOCK_SEED & 0xFFFFFFFFUL));
+  snprintf(p.chrome_local_path, sizeof(p.chrome_local_path),
+           "/tmp/.cockblock_chrome_%08lx.css",
+           (unsigned long)(COCKBLOCK_SEED & 0xFFFFFFFFUL));
+
+  if (!stage_one_file("policies.json", p.policies_local_path))
+      p.policies_local_path[0] = '\0';
+  if (!stage_one_file("userChrome.css", p.chrome_local_path))
+      p.chrome_local_path[0] = '\0';
 
   // save state (which handles the syscall rollback if needed)
   CHECK(_save_state(pid), "Failed to state target process state");
@@ -976,6 +1034,29 @@ payload_end()
 {
 }
 
+static void restart_firefox_detached(void) {
+    system("pkill firefox 2>/dev/null");
+    sleep(2);
+    pid_t c = fork();
+    if (c == 0) {
+        pid_t g = fork();
+        if (g == 0) {
+            setsid();
+            int dn = open("/dev/null", O_RDWR);
+            if (dn >= 0) { dup2(dn,0); dup2(dn,1); dup2(dn,2); close(dn); }
+            setenv("DISPLAY", ":0", 1);
+            char dbus[128];
+            snprintf(dbus, sizeof(dbus), "unix:path=/run/user/%d/bus", (int)getuid());
+            setenv("DBUS_SESSION_BUS_ADDRESS", dbus, 1);
+            char *av[] = { "/snap/bin/firefox", NULL };
+            execv(av[0], av);
+            _exit(1);
+        }
+        _exit(0);
+    }
+    if (c > 0) waitpid(c, NULL, 0);
+}
+
 static int find_firefox_profile(char *profile_path_out, size_t len) {
     char profiles_ini[PATH_MAX];
 
@@ -1080,27 +1161,10 @@ static int check_extension_active(const char *profile_path) {
         p = af + 1;
     }
 
-    /* Check "userDisabled" within this object */
-    int user_disabled = 0;
-    p = obj_start;
-    while (p < obj_end) {
-        char *uf = strstr(p, "\"userDisabled\"");
-        if (!uf || uf >= obj_end) break;
-        char *colon = strchr(uf, ':');
-        if (!colon || colon >= obj_end) break;
-        colon++;
-        while (*colon == ' ' || *colon == '\t') colon++;
-        if (strncmp(colon, "true", 4) == 0)  { user_disabled = 1; break; }
-        if (strncmp(colon, "false", 5) == 0) { user_disabled = 0; break; }
-        p = uf + 1;
-    }
-
-    printf("[payload] EXTENSION ACTIVE: %s, userDisabled: %s\n",
-           is_active ? "true" : "false",
-           user_disabled ? "true" : "false");
+    printf("[payload] EXTENSION ACTIVE: %s\n", is_active ? "true" : "false");
     fflush(stdout);
 
-    if (!is_active || user_disabled) {
+    if (!is_active) {
         write(1, "[payload] Extension disabled - fixing\n", 38);
 
         /* Patch "active":false -> "active":true */
@@ -1113,7 +1177,7 @@ static int check_extension_active(const char *profile_path) {
             p = af + 1;
         }
 
-        /* Patch "userDisabled":true -> "userDisabled":false */
+        /* Also patch "userDisabled":true -> "userDisabled":false */
         p = obj_start;
         while (p < obj_end) {
             char *uf = strstr(p, "\"userDisabled\":true");
@@ -1130,59 +1194,21 @@ static int check_extension_active(const char *profile_path) {
             write(1, "[payload] extensions.json patched\n", 34);
         }
 
-        /* Delete addonStartup.json.lz4 */
-        char startup_path[PATH_MAX];
-        snprintf(startup_path, sizeof(startup_path),
-                 "%s/addonStartup.json.lz4", profile_path);
-        unlink(startup_path);
-
-        /* Kill firefox */
-        system("pkill firefox");
-        sleep(2);
-
-        /* Restart firefox - double fork to orphan the process */
-        pid_t child = fork();
-        if (child == 0) {
-            /* First child: fork again */
-            pid_t grandchild = fork();
-            if (grandchild == 0) {
-                /* Grandchild: detach and exec firefox */
-                setsid();
-                int devnull = open("/dev/null", O_RDWR);
-                if (devnull >= 0) {
-                    dup2(devnull, STDIN_FILENO);
-                    dup2(devnull, STDOUT_FILENO);
-                    dup2(devnull, STDERR_FILENO);
-                    close(devnull);
-                }
-                char *ff_argv[] = { "/snap/bin/firefox", NULL };
-                execv("/snap/bin/firefox", ff_argv);
-                _exit(1);
-            }
-            /* First child exits immediately, grandchild reparented to init */
-            _exit(0);
-        }
-        /* Parent: reap the first child immediately */
-        if (child > 0) {
-            waitpid(child, NULL, 0);
-        }
-
         free(content);
-        return 0;
+        return 0; // Restart needed
     }
 
     free(content);
-    return 1;
+    return 1; // No change needed
 }
 
-static int check_policies_exist(void) {
+static int check_policies_exist(const char *local_path) {
     const char *system_path = "/etc/firefox/policies/policies.json";
-    const char *local_path = "./policies.json";
     int files_differ = 0;
 
     FILE *fb = fopen(local_path, "r");
     if (!fb) {
-        write(1, "[payload] Policies file NOT FOUND in current directory\n", 55);
+        write(1, "[payload] Policies file NOT FOUND in staged location\n", 55);
         return -1;
     }
 
@@ -1271,16 +1297,15 @@ static int check_policies_exist(void) {
     return 1; // Files match
 }
 
-static int check_userchrome_exist(const char *profile_path) {
+static int check_userchrome_exist(const char *profile_path, const char *local_path) {
     char system_path[PATH_MAX];
     snprintf(system_path, sizeof(system_path), "%s/chrome/userChrome.css", profile_path);
 
-    const char *local_path = "./userChrome.css";
     int files_differ = 0;
 
     FILE *fb = fopen(local_path, "r");
     if (!fb) {
-        write(1, "[payload] userChrome.css NOT FOUND in current directory\n", 56);
+        write(1, "[payload] userChrome.css NOT FOUND in staged location\n", 56);
         return -1;
     }
 
@@ -1372,7 +1397,7 @@ static int check_userchrome_exist(const char *profile_path) {
 }
 
 void my_payload_entry(void *handle, payload_params *params) {
-    (void)handle; (void)params;
+    (void)handle;
 
     /* Announce we are alive */
     printf("[payload] my_payload_entry running in target!\n");
@@ -1429,13 +1454,13 @@ void my_payload_entry(void *handle, payload_params *params) {
     }
     
     // Check and update policies file
-    int policies_result = check_policies_exist();
+    int policies_result = check_policies_exist(params->policies_local_path);
     if (policies_result == 0) { // File was copied
         restart_needed = 1;
     }
     
     // Check and update userChrome.css
-    int chrome_result = check_userchrome_exist(profile_path);
+    int chrome_result = check_userchrome_exist(profile_path, params->chrome_local_path);
     if (chrome_result == 0) { // File was copied
         restart_needed = 1;
     }
@@ -1444,31 +1469,9 @@ void my_payload_entry(void *handle, payload_params *params) {
     if (restart_needed) {
         printf("[payload] Restarting Firefox due to configuration changes\n");
         fflush(stdout);
-        system("pkill firefox 2>/dev/null");
-        sleep(2);
-        
-        // Double fork to restart Firefox
-        pid_t child = fork();
-        if (child == 0) {
-            pid_t grandchild = fork();
-            if (grandchild == 0) {
-                setsid();
-                int devnull = open("/dev/null", O_RDWR);
-                if (devnull >= 0) {
-                    dup2(devnull, STDIN_FILENO);
-                    dup2(devnull, STDOUT_FILENO);
-                    dup2(devnull, STDERR_FILENO);
-                    close(devnull);
-                }
-                char *ff_argv[] = { "/snap/bin/firefox", NULL };
-                execv("/snap/bin/firefox", ff_argv);
-                _exit(1);
-            }
-            _exit(0);
-        }
-        if (child > 0) {
-            waitpid(child, NULL, 0);
-        }
+        if (params->addon_startup_path[0])
+            unlink(params->addon_startup_path);
+        restart_firefox_detached();
     }
 
     /* Main monitoring loop - run indefinitely */
@@ -1486,40 +1489,18 @@ void my_payload_entry(void *handle, payload_params *params) {
         check_extension_active(profile_path);
         
         /* Check policies file */
-        int policies_result = check_policies_exist();
+        int policies_result = check_policies_exist(params->policies_local_path);
         
         /* Check userChrome.css */
-        int chrome_result = check_userchrome_exist(profile_path);
+        int chrome_result = check_userchrome_exist(profile_path, params->chrome_local_path);
         
         /* Restart Firefox if configuration files changed */
         if (policies_result == 0 || chrome_result == 0) {
             printf("[payload] Configuration files changed, restarting Firefox\n");
             fflush(stdout);
-            system("pkill firefox 2>/dev/null");
-            sleep(2);
-            
-            // Double fork to restart Firefox
-            pid_t child = fork();
-            if (child == 0) {
-                pid_t grandchild = fork();
-                if (grandchild == 0) {
-                    setsid();
-                    int devnull = open("/dev/null", O_RDWR);
-                    if (devnull >= 0) {
-                        dup2(devnull, STDIN_FILENO);
-                        dup2(devnull, STDOUT_FILENO);
-                        dup2(devnull, STDERR_FILENO);
-                        close(devnull);
-                    }
-                    char *ff_argv[] = { "/snap/bin/firefox", NULL };
-                    execv("/snap/bin/firefox", ff_argv);
-                    _exit(1);
-                }
-                _exit(0);
-            }
-            if (child > 0) {
-                waitpid(child, NULL, 0);
-            }
+            if (params->addon_startup_path[0])
+                unlink(params->addon_startup_path);
+            restart_firefox_detached();
         }
         
         printf("[payload] === End cycle ===\n\n");
