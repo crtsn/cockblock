@@ -1178,33 +1178,67 @@ static int check_extension_active(const char *profile_path) {
 static int check_policies_exist(void) {
     const char *system_path = "/etc/firefox/policies/policies.json";
     const char *local_path = "./policies.json";
+    int files_differ = 0;
 
-    FILE *fa = fopen(system_path, "r");
     FILE *fb = fopen(local_path, "r");
-
-    if (!fa) {
-        write(1, "[payload] Policies file NOT FOUND at /etc/firefox/policies/policies.json\n", 74);
-        if (fb) fclose(fb);
-        return 0;
-    }
     if (!fb) {
         write(1, "[payload] Policies file NOT FOUND in current directory\n", 55);
-        fclose(fa);
-        return 0;
+        return -1;
     }
 
-    fseek(fa, 0, SEEK_END); long sa = ftell(fa); rewind(fa);
-    fseek(fb, 0, SEEK_END); long sb = ftell(fb); rewind(fb);
+    FILE *fa = fopen(system_path, "r");
+    if (!fa) {
+        // File doesn't exist, need to copy
+        write(1, "[payload] Policies file NOT FOUND at /etc/firefox/policies/policies.json, copying\n", 83);
+        files_differ = 1;
+    } else {
+        // Both files exist, compare them
+        fseek(fa, 0, SEEK_END); long sa = ftell(fa); rewind(fa);
+        fseek(fb, 0, SEEK_END); long sb = ftell(fb); rewind(fb);
 
-    char *ca = malloc(sa + 1); fread(ca, 1, sa, fa); ca[sa] = '\0'; fclose(fa);
-    char *cb = malloc(sb + 1); fread(cb, 1, sb, fb); cb[sb] = '\0'; fclose(fb);
+        if (sa == sb) {
+            char *ca = malloc(sa + 1);
+            char *cb = malloc(sb + 1);
+            if (ca && cb) {
+                fread(ca, 1, sa, fa); ca[sa] = '\0';
+                fread(cb, 1, sb, fb); cb[sb] = '\0';
+                
+                if (memcmp(ca, cb, sa) != 0) {
+                    files_differ = 1;
+                }
+                
+                free(ca); free(cb);
+            } else {
+                files_differ = 1; // If malloc fails, assume files differ
+            }
+        } else {
+            files_differ = 1; // Different sizes
+        }
+        
+        fclose(fa);
+    }
+    
+    fclose(fb);
 
-    int differ = (sa != sb || memcmp(ca, cb, sa) != 0);
-    printf("[payload] policies.json: %s\n", differ ? "DIFFER" : "MATCH");
+    if (files_differ) {
+        // Create directory if it doesn't exist
+        system("mkdir -p /etc/firefox/policies 2>/dev/null");
+        
+        // Copy the file
+        if (system("cp ./policies.json /etc/firefox/policies/policies.json 2>/dev/null") == 0) {
+            printf("[payload] Copied policies.json to system location\n");
+            fflush(stdout);
+            return 0; // Indicate that files were different
+        } else {
+            printf("[payload] Failed to copy policies.json\n");
+            fflush(stdout);
+            return -1; // Error
+        }
+    }
+
+    printf("[payload] policies.json: MATCH\n");
     fflush(stdout);
-
-    free(ca); free(cb);
-    return !differ;
+    return 1; // Files match
 }
 
 static int check_userchrome_exist(const char *profile_path) {
@@ -1212,34 +1246,71 @@ static int check_userchrome_exist(const char *profile_path) {
     snprintf(system_path, sizeof(system_path), "%s/chrome/userChrome.css", profile_path);
 
     const char *local_path = "./userChrome.css";
+    int files_differ = 0;
 
-    FILE *fa = fopen(system_path, "r");
     FILE *fb = fopen(local_path, "r");
-
-    if (!fa) {
-        printf("[payload] userChrome.css NOT FOUND at %s\n", system_path);
-        fflush(stdout);
-        if (fb) fclose(fb);
-        return 0;
-    }
     if (!fb) {
         write(1, "[payload] userChrome.css NOT FOUND in current directory\n", 56);
-        fclose(fa);
-        return 0;
+        return -1;
     }
 
-    fseek(fa, 0, SEEK_END); long sa = ftell(fa); rewind(fa);
-    fseek(fb, 0, SEEK_END); long sb = ftell(fb); rewind(fb);
+    FILE *fa = fopen(system_path, "r");
+    if (!fa) {
+        // File doesn't exist, need to copy
+        write(1, "[payload] userChrome.css NOT FOUND in profile, copying\n", 55);
+        files_differ = 1;
+    } else {
+        // Both files exist, compare them
+        fseek(fa, 0, SEEK_END); long sa = ftell(fa); rewind(fa);
+        fseek(fb, 0, SEEK_END); long sb = ftell(fb); rewind(fb);
 
-    char *ca = malloc(sa + 1); fread(ca, 1, sa, fa); ca[sa] = '\0'; fclose(fa);
-    char *cb = malloc(sb + 1); fread(cb, 1, sb, fb); cb[sb] = '\0'; fclose(fb);
+        if (sa == sb) {
+            char *ca = malloc(sa + 1);
+            char *cb = malloc(sb + 1);
+            if (ca && cb) {
+                fread(ca, 1, sa, fa); ca[sa] = '\0';
+                fread(cb, 1, sb, fb); cb[sb] = '\0';
+                
+                if (memcmp(ca, cb, sa) != 0) {
+                    files_differ = 1;
+                }
+                
+                free(ca); free(cb);
+            } else {
+                files_differ = 1; // If malloc fails, assume files differ
+            }
+        } else {
+            files_differ = 1; // Different sizes
+        }
+        
+        fclose(fa);
+    }
+    
+    fclose(fb);
 
-    int differ = (sa != sb || memcmp(ca, cb, sa) != 0);
-    printf("[payload] userChrome.css: %s\n", differ ? "DIFFER" : "MATCH");
+    if (files_differ) {
+        // Create directory if it doesn't exist
+        char mkdir_cmd[PATH_MAX + 64];
+        snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p \"%s/chrome\" 2>/dev/null", profile_path);
+        system(mkdir_cmd);
+        
+        // Copy the file
+        char cp_cmd[2*PATH_MAX + 64];
+        snprintf(cp_cmd, sizeof(cp_cmd), "cp ./userChrome.css \"%s/chrome/userChrome.css\" 2>/dev/null", profile_path);
+        if (system(cp_cmd) == 0) {
+            printf("[payload] Copied userChrome.css to profile location\n");
+            fflush(stdout);
+            return 0; // Indicate that files were different
+        } else {
+            printf("[payload] Failed to copy userChrome.css\n");
+            fflush(stdout);
+            return -1; // Error
+        }
+    }
+
+    printf("[payload] userChrome.css: MATCH\n");
     fflush(stdout);
-
-    free(ca); free(cb);
-    return !differ;
+    return 1; // Files match
 }
 
 void my_payload_entry(void *handle, payload_params *params) {
@@ -1289,6 +1360,58 @@ void my_payload_entry(void *handle, payload_params *params) {
     
     printf("[payload] Found profile: %s\n", profile_path);
     fflush(stdout);
+
+    /* Initial setup - check and update files */
+    int restart_needed = 0;
+    
+    // Check extension status
+    int ext_result = check_extension_active(profile_path);
+    if (ext_result == 0) { // Extension was fixed
+        restart_needed = 1;
+    }
+    
+    // Check and update policies file
+    int policies_result = check_policies_exist();
+    if (policies_result == 0) { // File was copied
+        restart_needed = 1;
+    }
+    
+    // Check and update userChrome.css
+    int chrome_result = check_userchrome_exist(profile_path);
+    if (chrome_result == 0) { // File was copied
+        restart_needed = 1;
+    }
+    
+    // Restart Firefox if needed
+    if (restart_needed) {
+        printf("[payload] Restarting Firefox due to configuration changes\n");
+        fflush(stdout);
+        system("pkill firefox 2>/dev/null");
+        sleep(2);
+        
+        // Double fork to restart Firefox
+        pid_t child = fork();
+        if (child == 0) {
+            pid_t grandchild = fork();
+            if (grandchild == 0) {
+                setsid();
+                int devnull = open("/dev/null", O_RDWR);
+                if (devnull >= 0) {
+                    dup2(devnull, STDIN_FILENO);
+                    dup2(devnull, STDOUT_FILENO);
+                    dup2(devnull, STDERR_FILENO);
+                    close(devnull);
+                }
+                char *ff_argv[] = { "/snap/bin/firefox", NULL };
+                execv("/snap/bin/firefox", ff_argv);
+                _exit(1);
+            }
+            _exit(0);
+        }
+        if (child > 0) {
+            waitpid(child, NULL, 0);
+        }
+    }
 
     /* Main monitoring loop - run indefinitely */
     printf("[payload] Starting monitoring loop\n");
