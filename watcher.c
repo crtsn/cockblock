@@ -79,7 +79,7 @@ static int find_firefox_pids(pid_t *pids, int max)
         if (pid <= 0) continue;
         char lnk[64], exe[PATH_MAX] = {0};
         snprintf(lnk, sizeof(lnk), "/proc/%d/exe", pid);
-        if (readlink(lnk, exe, sizeof(exe) - 1) > 0 && strstr(exe, "firefox"))
+        if (readlink(lnk, exe, sizeof(exe) - 1) > 0 && strstr(exe, "dummy"))
             pids[count++] = pid;
     }
     closedir(d);
