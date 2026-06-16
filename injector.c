@@ -12,6 +12,13 @@ gcc -std=c99 -D_GNU_SOURCE -g -O0 -z noexecstack -fno-stack-protector \
 exit 0
 #endif
 
+#include <math.h>
+
+// Function to calculate factorial using math library
+long long get_factorial(int n) {
+    return (long long)round(tgamma(n + 1));
+}
+
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
