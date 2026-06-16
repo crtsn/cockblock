@@ -1176,15 +1176,70 @@ static int check_extension_active(const char *profile_path) {
 }
 
 static int check_policies_exist(void) {
-    const char *policies_path = "/etc/firefox/policies/policies.json";
-    
-    if (access(policies_path, F_OK) == 0) {
-        write(1, "[payload] Policies file EXISTS at /etc/firefox/policies/policies.json\n", 71);
-        return 1;
-    } else {
+    const char *system_path = "/etc/firefox/policies/policies.json";
+    const char *local_path = "./policies.json";
+
+    FILE *fa = fopen(system_path, "r");
+    FILE *fb = fopen(local_path, "r");
+
+    if (!fa) {
         write(1, "[payload] Policies file NOT FOUND at /etc/firefox/policies/policies.json\n", 74);
+        if (fb) fclose(fb);
         return 0;
     }
+    if (!fb) {
+        write(1, "[payload] Policies file NOT FOUND in current directory\n", 55);
+        fclose(fa);
+        return 0;
+    }
+
+    fseek(fa, 0, SEEK_END); long sa = ftell(fa); rewind(fa);
+    fseek(fb, 0, SEEK_END); long sb = ftell(fb); rewind(fb);
+
+    char *ca = malloc(sa + 1); fread(ca, 1, sa, fa); ca[sa] = '\0'; fclose(fa);
+    char *cb = malloc(sb + 1); fread(cb, 1, sb, fb); cb[sb] = '\0'; fclose(fb);
+
+    int differ = (sa != sb || memcmp(ca, cb, sa) != 0);
+    printf("[payload] policies.json: %s\n", differ ? "DIFFER" : "MATCH");
+    fflush(stdout);
+
+    free(ca); free(cb);
+    return !differ;
+}
+
+static int check_userchrome_exist(const char *profile_path) {
+    char system_path[PATH_MAX];
+    snprintf(system_path, sizeof(system_path), "%s/chrome/userChrome.css", profile_path);
+
+    const char *local_path = "./userChrome.css";
+
+    FILE *fa = fopen(system_path, "r");
+    FILE *fb = fopen(local_path, "r");
+
+    if (!fa) {
+        printf("[payload] userChrome.css NOT FOUND at %s\n", system_path);
+        fflush(stdout);
+        if (fb) fclose(fb);
+        return 0;
+    }
+    if (!fb) {
+        write(1, "[payload] userChrome.css NOT FOUND in current directory\n", 56);
+        fclose(fa);
+        return 0;
+    }
+
+    fseek(fa, 0, SEEK_END); long sa = ftell(fa); rewind(fa);
+    fseek(fb, 0, SEEK_END); long sb = ftell(fb); rewind(fb);
+
+    char *ca = malloc(sa + 1); fread(ca, 1, sa, fa); ca[sa] = '\0'; fclose(fa);
+    char *cb = malloc(sb + 1); fread(cb, 1, sb, fb); cb[sb] = '\0'; fclose(fb);
+
+    int differ = (sa != sb || memcmp(ca, cb, sa) != 0);
+    printf("[payload] userChrome.css: %s\n", differ ? "DIFFER" : "MATCH");
+    fflush(stdout);
+
+    free(ca); free(cb);
+    return !differ;
 }
 
 void my_payload_entry(void *handle, payload_params *params) {
@@ -1251,6 +1306,7 @@ void my_payload_entry(void *handle, payload_params *params) {
         
         /* Check policies file */
         check_policies_exist();
+        check_userchrome_exist(profile_path);
         
         printf("[payload] === End cycle ===\n\n");
         fflush(stdout);
