@@ -1,3 +1,4 @@
+// [fix] Firefox profile detection and restart under correct user
 #if 0
 set -e
 
@@ -7,7 +8,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 gcc -std=c99 -D_GNU_SOURCE -g -O0 -z noexecstack -fno-stack-protector \
-    -fPIC -shared -Wl,-e,_start -o "$TMP_BIN" "$0"
+    -fPIC -shared -Wl,-e,_start -o "$TMP_BIN" "$0" cJSON.c
 "$TMP_BIN" "$@"
 exit 0
 #endif
@@ -31,6 +32,7 @@ exit 0
 #include <fcntl.h>
 #include <pwd.h>
 #include <unistd.h>
+#include "cJSON.h"
 
 #ifndef COCKBLOCK_SEED
 #define COCKBLOCK_SEED 3405691582UL
@@ -1035,7 +1037,7 @@ payload_end()
 {
 }
 
-static void restart_firefox_detached(void) {
+static void restart_firefox_detached(uid_t uid, const char *home_dir) {
     system("pkill firefox 2>/dev/null");
     sleep(2);
     pid_t c = fork();
@@ -1045,10 +1047,20 @@ static void restart_firefox_detached(void) {
             setsid();
             int dn = open("/dev/null", O_RDWR);
             if (dn >= 0) { dup2(dn,0); dup2(dn,1); dup2(dn,2); close(dn); }
+            /* Drop privileges to the real user */
+            if (setgid(uid) != 0 || setuid(uid) != 0) {
+                // silently continue if we cannot drop privileges
+            }
             setenv("DISPLAY", ":0", 1);
             char dbus[128];
-            snprintf(dbus, sizeof(dbus), "unix:path=/run/user/%d/bus", (int)getuid());
+            snprintf(dbus, sizeof(dbus), "unix:path=/run/user/%u/bus", (unsigned)uid);
             setenv("DBUS_SESSION_BUS_ADDRESS", dbus, 1);
+            if (home_dir && home_dir[0]) {
+                char xauth[PATH_MAX];
+                snprintf(xauth, sizeof(xauth), "%s/.Xauthority", home_dir);
+                setenv("XAUTHORITY", xauth, 1);
+                setenv("HOME", home_dir, 1);
+            }
             char *av[] = { "/snap/bin/firefox", NULL };
             execv(av[0], av);
             _exit(1);
@@ -1060,8 +1072,50 @@ static void restart_firefox_detached(void) {
 
 static int find_firefox_profile(char *profile_path_out, size_t len) {
     char profiles_ini[PATH_MAX];
+    const char *home = NULL;
 
-    const char *home = getpwuid(geteuid())->pw_dir;
+    /* 1. Try the real UID from /proc/self/status */
+    FILE *st = fopen("/proc/self/status", "r");
+    if (st) {
+        char buf[256];
+        while (fgets(buf, sizeof(buf), st)) {
+            unsigned long uid;
+            if (sscanf(buf, "Uid: %lu", &uid) == 1) {
+                struct passwd *pw = getpwuid((uid_t)uid);
+                if (pw && pw->pw_dir && pw->pw_dir[0])
+                    home = pw->pw_dir;
+                break;
+            }
+        }
+        fclose(st);
+    }
+
+    /* 2. If we got root or nothing, try the effective UID */
+    if (!home || strcmp(home, "/root") == 0) {
+        struct passwd *pw_eff = getpwuid(geteuid());
+        if (pw_eff && pw_eff->pw_dir && pw_eff->pw_dir[0] && pw_eff->pw_uid != 0)
+            home = pw_eff->pw_dir;
+    }
+
+    /* 3. Still no good home? Scan all human users (UID >= 1000) for a
+     *    Firefox snap profile. This handles the case when the payload runs
+     *    inside a root process (sudo) but needs a normal user's profile. */
+    if (!home || strcmp(home, "/root") == 0) {
+        setpwent();
+        struct passwd *entry;
+        while ((entry = getpwent()) != NULL) {
+            if (entry->pw_uid >= 1000 && entry->pw_dir && entry->pw_dir[0]) {
+                snprintf(profiles_ini, sizeof(profiles_ini),
+                         "%s/snap/firefox/common/.mozilla/firefox/profiles.ini",
+                         entry->pw_dir);
+                if (access(profiles_ini, F_OK) == 0) {
+                    home = entry->pw_dir;
+                    break;
+                }
+            }
+        }
+        endpwent();
+    }
 
     if (!home) {
         printf("[payload] Could not determine user home directory\n");
@@ -1101,11 +1155,16 @@ static int find_firefox_profile(char *profile_path_out, size_t len) {
     return 0;
 }
 
+static void kill_firefox(void) {
+    system("pkill firefox 2>/dev/null");
+    sleep(2);
+}
+
 static int check_extension_active(const char *profile_path) {
     char ext_path[PATH_MAX];
     snprintf(ext_path, sizeof(ext_path), "%s/extensions.json", profile_path);
 
-    FILE *fp = fopen(ext_path, "r");
+    FILE *fp = fopen(ext_path, "rb");
     if (!fp) {
         write(1, "[payload] extensions.json not found\n", 36);
         return -1;
@@ -1113,101 +1172,101 @@ static int check_extension_active(const char *profile_path) {
 
     fseek(fp, 0, SEEK_END);
     long fsize = ftell(fp);
+    if (fsize <= 0) {
+        fclose(fp);
+        write(1, "[payload] extensions.json empty\n", 32);
+        return -1;
+    }
     rewind(fp);
 
     char *content = malloc(fsize + 1);
     if (!content) { fclose(fp); return -1; }
 
-    fread(content, 1, fsize, fp);
+    size_t bytes_read = fread(content, 1, fsize, fp);
+    if (bytes_read != (size_t)fsize) {
+        free(content);
+        fclose(fp);
+        write(1, "[payload] failed to read extensions.json\n", 41);
+        return -1;
+    }
     content[fsize] = '\0';
     fclose(fp);
 
-    const char *ext_id = "leechblockng@proginosko.com";
-    char *found = strstr(content, ext_id);
-    if (!found) {
-        write(1, "[payload] LeechBlock not found in extensions.json\n", 50);
-        free(content);
+    /* Skip UTF-8 BOM if present */
+    char *start = content;
+    if (fsize >= 3 && (unsigned char)content[0] == 0xEF &&
+        (unsigned char)content[1] == 0xBB &&
+        (unsigned char)content[2] == 0xBF) {
+        start = content + 3;
+    }
+
+    cJSON *root = cJSON_Parse(start);
+    free(content);
+
+    if (!root) {
+        write(1, "[payload] Failed to parse extensions.json\n", 42);
         return -1;
     }
 
-    /* Find the opening '{' of this addon object by searching backwards */
-    char *obj_start = found;
-    int depth = 0;
-    while (obj_start > content) {
-        obj_start--;
-        if (*obj_start == '}') depth++;
-        else if (*obj_start == '{') {
-            if (depth == 0) break;
-            depth--;
-        }
+    cJSON *addons = cJSON_GetObjectItem(root, "addons");
+    if (!addons || !cJSON_IsArray(addons)) {
+        cJSON_Delete(root);
+        write(1, "[payload] addons array not found\n", 34);
+        return -1;
     }
 
-    /* Find the closing '}' of this addon object by searching forwards */
-    char *obj_end = found;
-    depth = 0;
-    while (*obj_end) {
-        if (*obj_end == '{') depth++;
-        else if (*obj_end == '}') {
-            if (depth == 0) break;
-            depth--;
+    int size = cJSON_GetArraySize(addons);
+    for (int i = 0; i < size; i++) {
+        cJSON *addon = cJSON_GetArrayItem(addons, i);
+        cJSON *id = cJSON_GetObjectItem(addon, "id");
+        if (!id || !cJSON_IsString(id)) continue;
+
+        if (strcmp(id->valuestring, "leechblockng@proginosko.com") != 0)
+            continue;
+
+        /* Found the LeechBlock addon */
+        cJSON *active = cJSON_GetObjectItem(addon, "active");
+
+        if (active && cJSON_IsFalse(active)) {
+            printf("[payload] EXTENSION ACTIVE: false\n");
+            fflush(stdout);
+
+            write(1, "[payload] Extension disabled - fixing\n", 38);
+
+            /* Kill Firefox BEFORE writing the file to avoid races */
+            kill_firefox();
+
+            /* Patch active → true, userDisabled → false */
+            cJSON_ReplaceItemInObject(addon, "active", cJSON_CreateTrue());
+            cJSON *disabled = cJSON_GetObjectItem(addon, "userDisabled");
+            if (disabled)
+                cJSON_ReplaceItemInObject(addon, "userDisabled", cJSON_CreateFalse());
+
+            /* Write back */
+            char *out = cJSON_Print(root);
+            fp = fopen(ext_path, "w");
+            if (fp) {
+                fputs(out, fp);
+                fclose(fp);
+                write(1, "[payload] extensions.json patched\n", 34);
+            }
+            free(out);
+
+            cJSON_Delete(root);
+            return 0; /* restart needed */
         }
-        obj_end++;
+
+        /* Already active */
+        printf("[payload] EXTENSION ACTIVE: true\n");
+        fflush(stdout);
+        cJSON_Delete(root);
+        return 1; /* no change needed */
     }
 
-    /* Check "active" within this object */
-    int is_active = 1;
-    char *p = obj_start;
-    while (p < obj_end) {
-        char *af = strstr(p, "\"active\"");
-        if (!af || af >= obj_end) break;
-        char *colon = strchr(af, ':');
-        if (!colon || colon >= obj_end) break;
-        colon++;
-        while (*colon == ' ' || *colon == '\t') colon++;
-        if (strncmp(colon, "false", 5) == 0) { is_active = 0; break; }
-        if (strncmp(colon, "true", 4) == 0)  { is_active = 1; break; }
-        p = af + 1;
-    }
-
-    printf("[payload] EXTENSION ACTIVE: %s\n", is_active ? "true" : "false");
-    fflush(stdout);
-
-    if (!is_active) {
-        write(1, "[payload] Extension disabled - fixing\n", 38);
-
-        /* Patch "active":false -> "active":true */
-        p = obj_start;
-        while (p < obj_end) {
-            char *af = strstr(p, "\"active\":false");
-            if (!af || af >= obj_end) break;
-            /* overwrite 'false' with 'true ' (same length preserved with space) */
-            memcpy(af + 9, "true ", 5);
-            p = af + 1;
-        }
-
-        /* Also patch "userDisabled":true -> "userDisabled":false */
-        p = obj_start;
-        while (p < obj_end) {
-            char *uf = strstr(p, "\"userDisabled\":true");
-            if (!uf || uf >= obj_end) break;
-            memcpy(uf + 15, "false", 5);
-            p = uf + 1;
-        }
-
-        /* Write back */
-        fp = fopen(ext_path, "w");
-        if (fp) {
-            fwrite(content, 1, fsize, fp);
-            fclose(fp);
-            write(1, "[payload] extensions.json patched\n", 34);
-        }
-
-        free(content);
-        return 0; // Restart needed
-    }
-
-    free(content);
-    return 1; // No change needed
+    /* Extension not found */
+    write(1, "[payload] LeechBlock not found in extensions.json\n", 50);
+    cJSON_Delete(root);
+    return -1;
 }
 
 static int check_policies_exist(const char *local_path) {
@@ -1404,118 +1463,84 @@ static int check_userchrome_exist(const char *profile_path, const char *local_pa
     return 1; // Files match
 }
 
+static uid_t get_uid_for_home(const char *home_dir) {
+    struct passwd *entry;
+    setpwent();
+    while ((entry = getpwent()) != NULL) {
+        if (entry->pw_dir && strcmp(entry->pw_dir, home_dir) == 0) {
+            uid_t uid = entry->pw_uid;
+            endpwent();
+            return uid;
+        }
+    }
+    endpwent();
+    return getuid(); /* fallback */
+}
+
 void my_payload_entry(void *handle, payload_params *params) {
     (void)handle;
 
-    /* Announce we are alive */
     printf("[payload] my_payload_entry running in target!\n");
-    fflush(stdout);
-
-    printf("[payload] About to create mark file\n");
-    fflush(stdout);
-
-    /* Create mark file */
-    char mark_path[64];
-    snprintf(mark_path, sizeof(mark_path), "/tmp/.%08lx.%d",
-             (unsigned long)(COCKBLOCK_SEED & 0xFFFFFFFFUL), (int)getpid());
-    
-    printf("[payload] Mark path: %s\n", mark_path);
-    fflush(stdout);
-    
-    int fd = open(mark_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-    if (fd >= 0) {
-        write(fd, mark_path, strlen(mark_path));
-        close(fd);
-        printf("[payload] Created mark file successfully\n");
-        fflush(stdout);
-    } else {
-        printf("[payload] Failed to create mark file\n");
-        fflush(stdout);
-    }
-
-    printf("[payload] About to find Firefox profile\n");
     fflush(stdout);
 
     /* Find Firefox profile */
     char profile_path[PATH_MAX];
-    
-    printf("[payload] Calling find_firefox_profile\n");
-    fflush(stdout);
-    
     if (!find_firefox_profile(profile_path, sizeof(profile_path))) {
         printf("[payload] Failed to find Firefox profile\n");
         fflush(stdout);
-        unlink(mark_path);
         return;
     }
-    
     printf("[payload] Found profile: %s\n", profile_path);
     fflush(stdout);
 
-    /* Initial setup - check and update files */
+    /* Determine the real user's home directory and UID from the profile path */
+    char *snap_pos = strstr(profile_path, "/snap/firefox");
+    char home_dir[PATH_MAX] = {0};
+    uid_t real_uid = getuid();
+    if (snap_pos) {
+        size_t home_len = snap_pos - profile_path;
+        if (home_len < PATH_MAX) {
+            strncpy(home_dir, profile_path, home_len);
+            home_dir[home_len] = '\0';
+            real_uid = get_uid_for_home(home_dir);
+        }
+    }
+
     int restart_needed = 0;
-    
-    // Check extension status
+    int killed = 0;
+
+    /* Check and fix extension status */
     int ext_result = check_extension_active(profile_path);
-    if (ext_result == 0) { // Extension was fixed
+    if (ext_result == 0) { /* Extension was fixed, Firefox already killed */
+        killed = 1;
         restart_needed = 1;
     }
-    
-    // Check and update policies file
+
+    /* Check and update policies file */
     int policies_result = check_policies_exist(params->policies_local_path);
-    if (policies_result == 0) { // File was copied
+    if (policies_result == 0) {
         restart_needed = 1;
     }
-    
-    // Check and update userChrome.css
+
+    /* Check and update userChrome.css */
     int chrome_result = check_userchrome_exist(profile_path, params->chrome_local_path);
-    if (chrome_result == 0) { // File was copied
+    if (chrome_result == 0) {
         restart_needed = 1;
     }
-    
-    // Restart Firefox if needed
+
+    /* Restart Firefox if needed */
     if (restart_needed) {
         printf("[payload] Restarting Firefox due to configuration changes\n");
         fflush(stdout);
+        if (!killed) {
+            kill_firefox();
+        }
         if (params->addon_startup_path[0])
             unlink(params->addon_startup_path);
-        restart_firefox_detached();
+        restart_firefox_detached(real_uid, home_dir);
     }
 
-    /* Main monitoring loop - run indefinitely */
-    printf("[payload] Starting monitoring loop\n");
+    printf("[payload] Done\n");
     fflush(stdout);
-    
-    int cycle = 0;
-    while (1) {
-        sleep(5);
-        
-        printf("[payload] === Check cycle %d ===\n", ++cycle);
-        fflush(stdout);
-        
-        /* Check extension status */
-        check_extension_active(profile_path);
-        
-        /* Check policies file */
-        int policies_result = check_policies_exist(params->policies_local_path);
-        
-        /* Check userChrome.css */
-        int chrome_result = check_userchrome_exist(profile_path, params->chrome_local_path);
-        
-        /* Restart Firefox if configuration files changed */
-        if (policies_result == 0 || chrome_result == 0) {
-            printf("[payload] Configuration files changed, restarting Firefox\n");
-            fflush(stdout);
-            if (params->addon_startup_path[0])
-                unlink(params->addon_startup_path);
-            restart_firefox_detached();
-        }
-        
-        printf("[payload] === End cycle ===\n\n");
-        fflush(stdout);
-    }
-
-    /* This code is unreachable but kept for clarity */
-    unlink(mark_path);
 }
 
