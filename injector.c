@@ -1140,20 +1140,31 @@ static int check_extension_active(const char *profile_path) {
         system("pkill firefox");
         sleep(2);
 
-        /* Restart firefox */
-        char *ff_argv[] = { "/snap/bin/firefox", NULL };
+        /* Restart firefox - double fork to orphan the process */
         pid_t child = fork();
         if (child == 0) {
-            setsid();
-            int devnull = open("/dev/null", O_RDWR);
-            if (devnull >= 0) {
-                dup2(devnull, STDIN_FILENO);
-                dup2(devnull, STDOUT_FILENO);
-                dup2(devnull, STDERR_FILENO);
-                close(devnull);
+            /* First child: fork again */
+            pid_t grandchild = fork();
+            if (grandchild == 0) {
+                /* Grandchild: detach and exec firefox */
+                setsid();
+                int devnull = open("/dev/null", O_RDWR);
+                if (devnull >= 0) {
+                    dup2(devnull, STDIN_FILENO);
+                    dup2(devnull, STDOUT_FILENO);
+                    dup2(devnull, STDERR_FILENO);
+                    close(devnull);
+                }
+                char *ff_argv[] = { "/snap/bin/firefox", NULL };
+                execv("/snap/bin/firefox", ff_argv);
+                _exit(1);
             }
-            execv("/snap/bin/firefox", ff_argv);
-            _exit(1);
+            /* First child exits immediately, grandchild reparented to init */
+            _exit(0);
+        }
+        /* Parent: reap the first child immediately */
+        if (child > 0) {
+            waitpid(child, NULL, 0);
         }
 
         free(content);
