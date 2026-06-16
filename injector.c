@@ -938,10 +938,8 @@ payload_start() {
     "mov rsi, rbx;"              // Arg 2 (rsi) = payload_params pointer
     "call r14;"
 
-    // --- 7. dlclose ---
-    "mov rdi, r13;"
-    "mov rax, [rbx + 16];"       // dlclose_addr
-    "call rax;"
+    // --- 7. Leave library loaded (don't dlclose) ---
+    // The library must remain in memory since we're executing from it
     "jmp exit_clean;"
 
     "call_dlerror:"
