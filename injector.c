@@ -1208,7 +1208,7 @@ static int check_policies_exist(const char *local_path) {
 
     FILE *fb = fopen(local_path, "r");
     if (!fb) {
-        write(1, "[payload] Policies file NOT FOUND in staged location\n", 55);
+        puts("[payload] Policies file NOT FOUND in staged location");
         return -1;
     }
 
@@ -1305,7 +1305,7 @@ static int check_userchrome_exist(const char *profile_path, const char *local_pa
 
     FILE *fb = fopen(local_path, "r");
     if (!fb) {
-        write(1, "[payload] userChrome.css NOT FOUND in staged location\n", 56);
+        puts("[payload] userChrome.css NOT FOUND in staged location");
         return -1;
     }
 
