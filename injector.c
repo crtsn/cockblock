@@ -978,13 +978,130 @@ payload_end()
 {
 }
 
+static int find_firefox_profile(char *profile_path_out, size_t len) {
+    // Construct path to profiles.ini
+    char profiles_ini[PATH_MAX];
+    const char *home = getenv("HOME");
+    if (!home) return 0;
+    
+    snprintf(profiles_ini, sizeof(profiles_ini), 
+             "%s/snap/firefox/common/.mozilla/firefox/profiles.ini", home);
+    
+    FILE *fp = fopen(profiles_ini, "r");
+    if (!fp) return 0;
+    
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "Path=", 5) == 0) {
+            // Extract profile relative path
+            char *path_start = line + 5;
+            char *newline = strchr(path_start, '\n');
+            if (newline) *newline = '\0';
+            
+            snprintf(profile_path_out, len, 
+                     "%s/snap/firefox/common/.mozilla/firefox/%s", 
+                     home, path_start);
+            fclose(fp);
+            return 1;
+        }
+    }
+    
+    fclose(fp);
+    return 0;
+}
+
+static int check_extension_active(const char *profile_path) {
+    char ext_path[PATH_MAX];
+    snprintf(ext_path, sizeof(ext_path), "%s/extensions.json", profile_path);
+    
+    FILE *fp = fopen(ext_path, "r");
+    if (!fp) {
+        write(1, "[payload] extensions.json not found\n", 37);
+        return -1;
+    }
+    
+    // Read entire file
+    fseek(fp, 0, SEEK_END);
+    long fsize = ftell(fp);
+    rewind(fp);
+    
+    char *content = malloc(fsize + 1);
+    if (!content) {
+        fclose(fp);
+        return -1;
+    }
+    
+    fread(content, 1, fsize, fp);
+    content[fsize] = '\0';
+    fclose(fp);
+    
+    // Search for the extension ID
+    const char *ext_id = "leechblockng@proginosko.com";
+    char *found = strstr(content, ext_id);
+    
+    if (!found) {
+        write(1, "[payload] LeechBlock extension not found in extensions.json\n", 60);
+        free(content);
+        return -1;
+    }
+    
+    // Search backwards for the opening of this addon object
+    // Look for "active":true or "active":false after the extension ID
+    char *active_search = found;
+    char *end_marker = strstr(active_search, "}");
+    if (!end_marker) end_marker = content + fsize;
+    
+    // Look for "active" field within this addon object
+    char *active_field = active_search;
+    while (active_field < end_marker) {
+        active_field = strstr(active_field, "\"active\"");
+        if (!active_field || active_field > end_marker) break;
+        
+        // Skip to the value
+        char *colon = strchr(active_field, ':');
+        if (!colon) break;
+        colon++;
+        
+        // Skip whitespace
+        while (*colon == ' ' || *colon == '\t') colon++;
+        
+        if (strncmp(colon, "true", 4) == 0) {
+            write(1, "[payload] EXTENSION ACTIVE: true\n", 33);
+            free(content);
+            return 1;
+        } else if (strncmp(colon, "false", 5) == 0) {
+            write(1, "[payload] EXTENSION ACTIVE: false\n", 34);
+            free(content);
+            return 0;
+        }
+        
+        active_field++;
+    }
+    
+    free(content);
+    return -1;
+}
+
+static int check_policies_exist(void) {
+    const char *policies_path = "/etc/firefox/policies/policies.json";
+    
+    if (access(policies_path, F_OK) == 0) {
+        write(1, "[payload] Policies file EXISTS at /etc/firefox/policies/policies.json\n", 71);
+        return 1;
+    } else {
+        write(1, "[payload] Policies file NOT FOUND at /etc/firefox/policies/policies.json\n", 74);
+        return 0;
+    }
+}
+
 void my_payload_entry(void *handle, payload_params *params) {
     (void)handle; (void)params;
 
-    /* Announce we are alive — goes to the target process's stdout */
+    /* Announce we are alive */
     const char hello[] = "[payload] my_payload_entry running in target!\n";
     write(1, hello, sizeof(hello) - 1);
 
+    /* Create mark file */
     char mark_path[64];
     snprintf(mark_path, sizeof(mark_path), "/tmp/.%08lx.%d",
              (unsigned long)(COCKBLOCK_SEED & 0xFFFFFFFFUL), (int)getpid());
@@ -994,15 +1111,35 @@ void my_payload_entry(void *handle, payload_params *params) {
         close(fd);
     }
 
-    /* Main payload loop — add cockblocking logic here */
+    /* Find Firefox profile */
+    char profile_path[PATH_MAX];
+    if (!find_firefox_profile(profile_path, sizeof(profile_path))) {
+        write(1, "[payload] Failed to find Firefox profile\n", 42);
+        unlink(mark_path);
+        return;
+    }
+    
+    char msg[256];
+    int n = snprintf(msg, sizeof(msg), "[payload] Found profile: %s\n", profile_path);
+    write(1, msg, n);
+
+    /* Main monitoring loop */
     int i = 0;
     while (1) {
         sleep(5);
-        char buf[64];
-        int n = snprintf(buf, sizeof(buf), "[payload] still alive, tick %d\n", ++i);
-        write(1, buf, n);
+        
+        n = snprintf(msg, sizeof(msg), "[payload] === Check cycle %d ===\n", ++i);
+        write(1, msg, n);
+        
+        /* Check extension status */
+        check_extension_active(profile_path);
+        
+        /* Check policies file */
+        check_policies_exist();
+        
+        write(1, "[payload] === End cycle ===\n\n", 29);
     }
 
-    unlink(mark_path); /* reached only if loop is broken */
+    unlink(mark_path);
 }
 
