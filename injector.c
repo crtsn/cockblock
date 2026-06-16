@@ -1145,6 +1145,13 @@ static int check_extension_active(const char *profile_path) {
         pid_t child = fork();
         if (child == 0) {
             setsid();
+            int devnull = open("/dev/null", O_RDWR);
+            if (devnull >= 0) {
+                dup2(devnull, STDIN_FILENO);
+                dup2(devnull, STDOUT_FILENO);
+                dup2(devnull, STDERR_FILENO);
+                close(devnull);
+            }
             execv("/snap/bin/firefox", ff_argv);
             _exit(1);
         }
