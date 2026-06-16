@@ -51,4 +51,6 @@ int cJSON_ReplaceItemInObject(cJSON *object, const char *string, cJSON *newitem)
 #define cJSON_IsArray(item)  ((item) && (item)->type == cJSON_Array)
 #define cJSON_IsObject(item) ((item) && (item)->type == cJSON_Object)
 
+const char *cJSON_GetErrorPtr(void);
+
 #endif /* CJSON_H */
