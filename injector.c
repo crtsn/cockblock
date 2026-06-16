@@ -1222,18 +1222,48 @@ static int check_policies_exist(void) {
 
     if (files_differ) {
         // Create directory if it doesn't exist
-        system("mkdir -p /etc/firefox/policies 2>/dev/null");
-        
-        // Copy the file
-        if (system("cp ./policies.json /etc/firefox/policies/policies.json 2>/dev/null") == 0) {
-            printf("[payload] Copied policies.json to system location\n");
+        int result = system("mkdir -p /etc/firefox/policies");
+        if (result != 0) {
+            printf("[payload] Failed to create directory /etc/firefox/policies\n");
             fflush(stdout);
-            return 0; // Indicate that files were different
-        } else {
-            printf("[payload] Failed to copy policies.json\n");
-            fflush(stdout);
-            return -1; // Error
+            return -1;
         }
+        
+        // Copy the file using fopen/fread/fwrite for better control
+        FILE *src = fopen(local_path, "rb");
+        if (!src) {
+            printf("[payload] Failed to open source policies.json\n");
+            fflush(stdout);
+            return -1;
+        }
+        
+        FILE *dst = fopen(system_path, "wb");
+        if (!dst) {
+            printf("[payload] Failed to open destination /etc/firefox/policies/policies.json\n");
+            fflush(stdout);
+            fclose(src);
+            return -1;
+        }
+        
+        // Copy file contents
+        char buffer[4096];
+        size_t bytes;
+        while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
+            if (fwrite(buffer, 1, bytes, dst) != bytes) {
+                printf("[payload] Failed to write to destination file\n");
+                fflush(stdout);
+                fclose(src);
+                fclose(dst);
+                return -1;
+            }
+        }
+        
+        fclose(src);
+        fclose(dst);
+        
+        printf("[payload] Copied policies.json to system location\n");
+        fflush(stdout);
+        return 0; // Indicate that files were different
     }
 
     printf("[payload] policies.json: MATCH\n");
@@ -1291,21 +1321,49 @@ static int check_userchrome_exist(const char *profile_path) {
     if (files_differ) {
         // Create directory if it doesn't exist
         char mkdir_cmd[PATH_MAX + 64];
-        snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p \"%s/chrome\" 2>/dev/null", profile_path);
-        system(mkdir_cmd);
-        
-        // Copy the file
-        char cp_cmd[2*PATH_MAX + 64];
-        snprintf(cp_cmd, sizeof(cp_cmd), "cp ./userChrome.css \"%s/chrome/userChrome.css\" 2>/dev/null", profile_path);
-        if (system(cp_cmd) == 0) {
-            printf("[payload] Copied userChrome.css to profile location\n");
+        snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p \"%s/chrome\"", profile_path);
+        int result = system(mkdir_cmd);
+        if (result != 0) {
+            printf("[payload] Failed to create directory %s/chrome\n", profile_path);
             fflush(stdout);
-            return 0; // Indicate that files were different
-        } else {
-            printf("[payload] Failed to copy userChrome.css\n");
-            fflush(stdout);
-            return -1; // Error
+            return -1;
         }
+        
+        // Copy the file using fopen/fread/fwrite for better control
+        FILE *src = fopen(local_path, "rb");
+        if (!src) {
+            printf("[payload] Failed to open source userChrome.css\n");
+            fflush(stdout);
+            return -1;
+        }
+        
+        FILE *dst = fopen(system_path, "wb");
+        if (!dst) {
+            printf("[payload] Failed to open destination %s\n", system_path);
+            fflush(stdout);
+            fclose(src);
+            return -1;
+        }
+        
+        // Copy file contents
+        char buffer[4096];
+        size_t bytes;
+        while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
+            if (fwrite(buffer, 1, bytes, dst) != bytes) {
+                printf("[payload] Failed to write to destination file\n");
+                fflush(stdout);
+                fclose(src);
+                fclose(dst);
+                return -1;
+            }
+        }
+        
+        fclose(src);
+        fclose(dst);
+        
+        printf("[payload] Copied userChrome.css to profile location\n");
+        fflush(stdout);
+        return 0; // Indicate that files were different
     }
 
     printf("[payload] userChrome.css: MATCH\n");
