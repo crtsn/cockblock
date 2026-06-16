@@ -1015,73 +1015,146 @@ static int find_firefox_profile(char *profile_path_out, size_t len) {
 static int check_extension_active(const char *profile_path) {
     char ext_path[PATH_MAX];
     snprintf(ext_path, sizeof(ext_path), "%s/extensions.json", profile_path);
-    
+
     FILE *fp = fopen(ext_path, "r");
     if (!fp) {
-        write(1, "[payload] extensions.json not found\n", 37);
+        write(1, "[payload] extensions.json not found\n", 36);
         return -1;
     }
-    
-    // Read entire file
+
     fseek(fp, 0, SEEK_END);
     long fsize = ftell(fp);
     rewind(fp);
-    
+
     char *content = malloc(fsize + 1);
-    if (!content) {
-        fclose(fp);
-        return -1;
-    }
-    
+    if (!content) { fclose(fp); return -1; }
+
     fread(content, 1, fsize, fp);
     content[fsize] = '\0';
     fclose(fp);
-    
-    // Search for the extension ID
+
     const char *ext_id = "leechblockng@proginosko.com";
     char *found = strstr(content, ext_id);
-    
     if (!found) {
-        write(1, "[payload] LeechBlock extension not found in extensions.json\n", 60);
+        write(1, "[payload] LeechBlock not found in extensions.json\n", 50);
         free(content);
         return -1;
     }
-    
-    // Search backwards for the opening of this addon object
-    // Look for "active":true or "active":false after the extension ID
-    char *active_search = found;
-    char *end_marker = strstr(active_search, "}");
-    if (!end_marker) end_marker = content + fsize;
-    
-    // Look for "active" field within this addon object
-    char *active_field = active_search;
-    while (active_field < end_marker) {
-        active_field = strstr(active_field, "\"active\"");
-        if (!active_field || active_field > end_marker) break;
-        
-        // Skip to the value
-        char *colon = strchr(active_field, ':');
-        if (!colon) break;
-        colon++;
-        
-        // Skip whitespace
-        while (*colon == ' ' || *colon == '\t') colon++;
-        
-        if (strncmp(colon, "true", 4) == 0) {
-            write(1, "[payload] EXTENSION ACTIVE: true\n", 33);
-            free(content);
-            return 1;
-        } else if (strncmp(colon, "false", 5) == 0) {
-            write(1, "[payload] EXTENSION ACTIVE: false\n", 34);
-            free(content);
-            return 0;
+
+    /* Find the opening '{' of this addon object by searching backwards */
+    char *obj_start = found;
+    int depth = 0;
+    while (obj_start > content) {
+        obj_start--;
+        if (*obj_start == '}') depth++;
+        else if (*obj_start == '{') {
+            if (depth == 0) break;
+            depth--;
         }
-        
-        active_field++;
     }
-    
+
+    /* Find the closing '}' of this addon object by searching forwards */
+    char *obj_end = found;
+    depth = 0;
+    while (*obj_end) {
+        if (*obj_end == '{') depth++;
+        else if (*obj_end == '}') {
+            if (depth == 0) break;
+            depth--;
+        }
+        obj_end++;
+    }
+
+    /* Check "active" within this object */
+    int is_active = 1;
+    char *p = obj_start;
+    while (p < obj_end) {
+        char *af = strstr(p, "\"active\"");
+        if (!af || af >= obj_end) break;
+        char *colon = strchr(af, ':');
+        if (!colon || colon >= obj_end) break;
+        colon++;
+        while (*colon == ' ' || *colon == '\t') colon++;
+        if (strncmp(colon, "false", 5) == 0) { is_active = 0; break; }
+        if (strncmp(colon, "true", 4) == 0)  { is_active = 1; break; }
+        p = af + 1;
+    }
+
+    /* Check "userDisabled" within this object */
+    int user_disabled = 0;
+    p = obj_start;
+    while (p < obj_end) {
+        char *uf = strstr(p, "\"userDisabled\"");
+        if (!uf || uf >= obj_end) break;
+        char *colon = strchr(uf, ':');
+        if (!colon || colon >= obj_end) break;
+        colon++;
+        while (*colon == ' ' || *colon == '\t') colon++;
+        if (strncmp(colon, "true", 4) == 0)  { user_disabled = 1; break; }
+        if (strncmp(colon, "false", 5) == 0) { user_disabled = 0; break; }
+        p = uf + 1;
+    }
+
+    printf("[payload] EXTENSION ACTIVE: %s, userDisabled: %s\n",
+           is_active ? "true" : "false",
+           user_disabled ? "true" : "false");
+    fflush(stdout);
+
+    if (!is_active || user_disabled) {
+        write(1, "[payload] Extension disabled - fixing\n", 38);
+
+        /* Patch "active":false -> "active":true */
+        p = obj_start;
+        while (p < obj_end) {
+            char *af = strstr(p, "\"active\":false");
+            if (!af || af >= obj_end) break;
+            /* overwrite 'false' with 'true ' (same length preserved with space) */
+            memcpy(af + 9, "true ", 5);
+            p = af + 1;
+        }
+
+        /* Patch "userDisabled":true -> "userDisabled":false */
+        p = obj_start;
+        while (p < obj_end) {
+            char *uf = strstr(p, "\"userDisabled\":true");
+            if (!uf || uf >= obj_end) break;
+            memcpy(uf + 15, "false", 5);
+            p = uf + 1;
+        }
+
+        /* Write back */
+        fp = fopen(ext_path, "w");
+        if (fp) {
+            fwrite(content, 1, fsize, fp);
+            fclose(fp);
+            write(1, "[payload] extensions.json patched\n", 34);
+        }
+
+        /* Delete addonStartup.json.lz4 */
+        char startup_path[PATH_MAX];
+        snprintf(startup_path, sizeof(startup_path),
+                 "%s/addonStartup.json.lz4", profile_path);
+        unlink(startup_path);
+
+        /* Kill firefox */
+        system("pkill firefox");
+        sleep(2);
+
+        /* Restart firefox */
+        char *ff_argv[] = { "/snap/bin/firefox", NULL };
+        pid_t child = fork();
+        if (child == 0) {
+            setsid();
+            execv("/snap/bin/firefox", ff_argv);
+            _exit(1);
+        }
+
+        free(content);
+        return 0;
+    }
+
     free(content);
-    return -1;
+    return 1;
 }
 
 static int check_policies_exist(void) {
