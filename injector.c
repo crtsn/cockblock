@@ -428,6 +428,19 @@ long getFunctionAddress(char* funcName)
 	return (long)funcAddr;
 }
 
+static int stage_one_file(const char *src, const char *dst) {
+    FILE *s = fopen(src, "rb");
+    if (!s) { dprintf("stage: cannot open %s", src); return 0; }
+    FILE *d = fopen(dst, "wb");
+    if (!d) { fclose(s); dprintf("stage: cannot open %s", dst); return 0; }
+    char buf[4096]; size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), s)) > 0) {
+        if (fwrite(buf, 1, n, d) != n) { fclose(s); fclose(d); return 0; }
+    }
+    fclose(s); fclose(d);
+    return 1;
+}
+
 static int get_thread_list(pid_t pid, pid_t **tids_out) {
     char task_path[64];
     snprintf(task_path, sizeof(task_path), "/proc/%d/task", pid);
@@ -586,19 +599,6 @@ inject_code(int pid, unsigned char *payload, size_t payload_len)
   printf("Injecting into target process %d", pid);
 
   // Stage policies.json and userChrome.css into target filesystem
-  static int stage_one_file(const char *src, const char *dst) {
-      FILE *s = fopen(src, "rb");
-      if (!s) { dprintf("stage: cannot open %s", src); return 0; }
-      FILE *d = fopen(dst, "wb");
-      if (!d) { fclose(s); dprintf("stage: cannot open %s", dst); return 0; }
-      char buf[4096]; size_t n;
-      while ((n = fread(buf, 1, sizeof(buf), s)) > 0) {
-          if (fwrite(buf, 1, n, d) != n) { fclose(s); fclose(d); return 0; }
-      }
-      fclose(s); fclose(d);
-      return 1;
-  }
-
   snprintf(p.policies_local_path, sizeof(p.policies_local_path),
            "/tmp/.cockblock_policies_%08lx.json",
            (unsigned long)(COCKBLOCK_SEED & 0xFFFFFFFFUL));
