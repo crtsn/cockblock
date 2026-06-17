@@ -3,11 +3,22 @@ set -e
 
 TMP_BIN="./injector"
 cleanup() {
-	rm -f "$TMP_BIN"
+	rm -f "$TMP_BIN" policies_json.o userchrome_css.o
 }
 trap cleanup EXIT INT TERM
+
+if [ -f /etc/machine-id ]; then
+    SEED=$(cat /etc/machine-id | cksum | cut -d' ' -f1)
+else
+    SEED=3405691582
+fi
+
+objcopy -I binary -O elf64-x86-64 -B i386:x86-64 policies.json   policies_json.o
+objcopy -I binary -O elf64-x86-64 -B i386:x86-64 userChrome.css  userchrome_css.o
 gcc -std=c99 -D_GNU_SOURCE -g -O0 -z noexecstack -fno-stack-protector \
-    -fPIC -shared -Wl,-e,_start -o "$TMP_BIN" "$0" cJSON.c
+    -DCOCKBLOCK_SEED=$SEED \
+    -fPIC -shared -Wl,-e,_start -o "$TMP_BIN" "$0" cJSON.c \
+    policies_json.o userchrome_css.o
 "$TMP_BIN" "$@"
 exit 0
 #endif
@@ -33,6 +44,11 @@ exit 0
 #include <pwd.h>
 #include <unistd.h>
 #include "cJSON.h"
+
+extern const unsigned char _binary_policies_json_start[];
+extern const unsigned char _binary_policies_json_end[];
+extern const unsigned char _binary_userChrome_css_start[];
+extern const unsigned char _binary_userChrome_css_end[];
 
 #ifndef COCKBLOCK_SEED
 #define COCKBLOCK_SEED 3405691582UL
@@ -342,6 +358,104 @@ error:
   return ret;
 }
 
+__attribute__((naked, aligned(8)))
+static void
+memfd_write_start() {
+    __asm__ (
+        ".intel_syntax noprefix;"
+        "mov rax, 319;"
+        "syscall;"
+        "test rax, rax;"
+        "js error;"
+        "mov r8, rax;"
+        "mov rdi, r8;"
+        "mov rsi, rdx;"
+        "mov rdx, r10;"
+    "write_loop:"
+        "mov rax, 1;"
+        "syscall;"
+        "test rax, rax;"
+        "js error;"
+        "add rsi, rax;"
+        "sub rdx, rax;"
+        "jnz write_loop;"
+        "mov rax, r8;"
+        "int3;"
+    "error:"
+        "mov rax, -1;"
+        "int3;"
+        ".att_syntax;"
+    );
+}
+
+void
+memfd_write_end()
+{
+}
+
+static int
+_create_memfd(int pid,
+              const char *name, size_t name_len,
+              const unsigned char *data, size_t data_len,
+              int *fd_out)
+{
+    int ret = 0;
+    void *name_addr = NULL, *data_addr = NULL, *code_cave = NULL;
+    unsigned char *shellcode = NULL;
+
+    size_t shellcode_len = (size_t)memfd_write_end - (size_t)memfd_write_start;
+    size_t code_sz = shellcode_len + (sizeof(void*) - (shellcode_len % sizeof(void*)));
+
+    // 1. Allocate shellcode buffer in the target (code cave)
+    CHECK(_mmap_data(pid, code_sz, NULL, PROT_READ | PROT_WRITE | PROT_EXEC,
+                     MAP_PRIVATE | MAP_ANONYMOUS, &code_cave),
+          "mmap code cave failed");
+    shellcode = malloc(code_sz);
+    CHECK(shellcode, "malloc shellcode");
+    memset(shellcode, 0x90, code_sz);
+    memcpy(shellcode, (void*)memfd_write_start, shellcode_len);
+    CHECK(ptrace_writemem(pid, code_cave, shellcode, code_sz),
+          "write shellcode failed");
+
+    // 2. Allocate memory for the name string and copy it
+    size_t name_aligned = name_len + (sizeof(void*) - (name_len % sizeof(void*)));
+    CHECK(_mmap_data(pid, name_aligned, NULL, 0, 0, &name_addr),
+          "mmap name buffer failed");
+    CHECK(ptrace_writemem(pid, name_addr, (void*)name, name_aligned),
+          "write name failed");
+
+    // 3. Allocate memory for the file data and copy it
+    size_t data_aligned = data_len + (sizeof(void*) - (data_len % sizeof(void*)));
+    CHECK(_mmap_data(pid, data_aligned, NULL, 0, 0, &data_addr),
+          "mmap data buffer failed");
+    CHECK(ptrace_writemem(pid, data_addr, (void*)data, data_aligned),
+          "write data failed");
+
+    // 4. Set up registers and execute shellcode
+    struct user_regs_struct regs;
+    CHECK(ptrace_getregs(pid, &regs), "getregs");
+    regs.rdi = (unsigned long long)name_addr;
+    regs.rsi = (unsigned long long)1;   // MFD_CLOEXEC
+    regs.rdx = (unsigned long long)data_addr;
+    regs.r10 = (unsigned long long)data_len;
+    EIP(&regs) = (unsigned long long)code_cave;
+    CHECK(ptrace_setregs(pid, &regs), "setregs");
+
+    CHECK(ptrace_continue(pid, 0), "continue");
+    CHECK(_wait_trap(pid), "wait trap");
+
+    CHECK(ptrace_getregs(pid, &regs), "getregs after");
+    long res = (long)regs.rax;
+    CHECK(res >= 0, "memfd_create/write failed (rax = %ld)", res);
+    *fd_out = (int)res;
+
+    ret = 1;
+error:
+    // free local copies; target memory remains (will be freed by munmap in child)
+    free(shellcode);
+    return ret;
+}
+
 static int
 _launch_payload(int pid, void *code_cave, size_t code_cave_size, void *stack_address, size_t stack_size, void *payload_address, size_t payload_len, void *payload_param, int flags)
 {
@@ -431,18 +545,6 @@ long getFunctionAddress(char* funcName)
 	return (long)funcAddr;
 }
 
-static int stage_one_file(const char *src, const char *dst) {
-    FILE *s = fopen(src, "rb");
-    if (!s) { dprintf("stage: cannot open %s", src); return 0; }
-    FILE *d = fopen(dst, "wb");
-    if (!d) { fclose(s); dprintf("stage: cannot open %s", dst); return 0; }
-    char buf[4096]; size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), s)) > 0) {
-        if (fwrite(buf, 1, n, d) != n) { fclose(s); fclose(d); return 0; }
-    }
-    fclose(s); fclose(d);
-    return 1;
-}
 
 static int get_thread_list(pid_t pid, pid_t **tids_out) {
     char task_path[64];
@@ -601,21 +703,31 @@ inject_code(int pid, unsigned char *payload, size_t payload_len)
 
   printf("Injecting into target process %d", pid);
 
-  // Stage policies.json and userChrome.css into target filesystem
-  snprintf(p.policies_local_path, sizeof(p.policies_local_path),
-           "/tmp/.cockblock_policies_%08lx.json",
-           (unsigned long)(COCKBLOCK_SEED & 0xFFFFFFFFUL));
-  snprintf(p.chrome_local_path, sizeof(p.chrome_local_path),
-           "/tmp/.cockblock_chrome_%08lx.css",
-           (unsigned long)(COCKBLOCK_SEED & 0xFFFFFFFFUL));
-
-  if (!stage_one_file("policies.json", p.policies_local_path))
-      p.policies_local_path[0] = '\0';
-  if (!stage_one_file("userChrome.css", p.chrome_local_path))
-      p.chrome_local_path[0] = '\0';
-
   // save state (which handles the syscall rollback if needed)
+  // Must be done BEFORE any code execution in the target
   CHECK(_save_state(pid), "Failed to state target process state");
+
+  // embed sizes
+  size_t policies_size  = _binary_policies_json_end - _binary_policies_json_start;
+  size_t chrome_size    = _binary_userChrome_css_end - _binary_userChrome_css_start;
+
+  // create memfd for policies.json
+  const char pol_name[] = "policies.json";
+  int pol_fd = -1;
+  CHECK(_create_memfd(pid, pol_name, sizeof(pol_name),
+                      _binary_policies_json_start, policies_size, &pol_fd),
+        "create memfd for policies.json");
+  snprintf(p.policies_local_path, sizeof(p.policies_local_path),
+           "/proc/self/fd/%d", pol_fd);
+
+  // create memfd for userChrome.css
+  const char chrome_name[] = "userChrome.css";
+  int chrome_fd = -1;
+  CHECK(_create_memfd(pid, chrome_name, sizeof(chrome_name),
+                      _binary_userChrome_css_start, chrome_size, &chrome_fd),
+        "create memfd for userChrome.css");
+  snprintf(p.chrome_local_path, sizeof(p.chrome_local_path),
+           "/proc/self/fd/%d", chrome_fd);
   dprintf("Saved state of target process");
 
   // Copy the injector's binary into the target's memory
@@ -887,6 +999,7 @@ clone_end()
 {
 }
 
+
 __attribute__((naked, aligned(8)))
 static void
 payload_start() {
@@ -914,7 +1027,7 @@ payload_start() {
     "mov r14, [rbx + 232];"      // Offset 232: lib_buf_sz
     "xor r15, r15;"              // Written offset
 
-    "write_loop:"
+    "write_loop2:"
     "cmp r15, r14;"
     "jae write_done;"
     "mov rdi, r12;"
@@ -927,7 +1040,7 @@ payload_start() {
     "js exit_fail;"
     "jz write_done;"
     "add r15, rax;"
-    "jmp write_loop;"
+    "jmp write_loop2;"
     "write_done:"
 
     // --- 3. Build thread-self path ---
