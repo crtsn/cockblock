@@ -36,6 +36,9 @@ exit 0
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/select.h>
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
@@ -43,6 +46,7 @@ exit 0
 #include <fcntl.h>
 #include <pwd.h>
 #include <unistd.h>
+#include <signal.h>
 #include "cJSON.h"
 
 extern const unsigned char _binary_policies_json_start[];
@@ -53,6 +57,8 @@ extern const unsigned char _binary_userChrome_css_end[];
 #ifndef COCKBLOCK_SEED
 #define COCKBLOCK_SEED 3405691582UL
 #endif
+
+#define KILL_SWITCH_PATH "/tmp/.xsession-kill"
 
 typedef struct payload_params {
     long dlopen_addr;
@@ -123,21 +129,296 @@ int wait_stopped(int pid);
 #define dprintf(...)
 #endif
 
+/* ---------- New helper: find session process ---------- */
+static pid_t find_session_pid(void) {
+    const char *targets[] = {
+        "gnome-session",
+        "gnome-session-b",
+        "xfce4-session",
+        "lxqt-session",
+        "mate-session",
+        "cinnamon-sessio",
+        NULL
+    };
+    DIR *proc = opendir("/proc");
+    if (!proc) return -1;
+    struct dirent *de;
+    while ((de = readdir(proc)) != NULL) {
+        if (de->d_type != DT_DIR) continue;
+        pid_t pid = atoi(de->d_name);
+        if (pid <= 0) continue;
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        char comm[256] = {0};
+        if (fgets(comm, sizeof(comm), f)) {
+            comm[strcspn(comm, "\n")] = 0;
+            for (int i = 0; targets[i]; i++) {
+                if (strcmp(comm, targets[i]) == 0) {
+                    fclose(f);
+                    closedir(proc);
+                    return pid;
+                }
+            }
+        }
+        fclose(f);
+    }
+    closedir(proc);
+    return -1;
+}
+
+/* ---------- New helper: get environment variable from a user process ---------- */
+static char* get_env_from_uid(uid_t uid, const char *varname) {
+    DIR *proc = opendir("/proc");
+    if (!proc) return NULL;
+    struct dirent *de;
+    while ((de = readdir(proc)) != NULL) {
+        if (de->d_type != DT_DIR) continue;
+        pid_t pid = atoi(de->d_name);
+        if (pid <= 0) continue;
+
+        char status_path[64];
+        snprintf(status_path, sizeof(status_path), "/proc/%d/status", pid);
+        FILE *sf = fopen(status_path, "r");
+        if (!sf) continue;
+
+        uid_t proc_uid = -1;
+        char line[256];
+        while (fgets(line, sizeof(line), sf)) {
+            if (strncmp(line, "Uid:", 4) == 0) {
+                sscanf(line + 4, "%u", &proc_uid);
+                break;
+            }
+        }
+        fclose(sf);
+        if (proc_uid != uid) continue;
+
+        char env_path[64];
+        snprintf(env_path, sizeof(env_path), "/proc/%d/environ", pid);
+        int fd = open(env_path, O_RDONLY);
+        if (fd < 0) continue;
+
+        char *env_buf = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (env_buf == MAP_FAILED) continue;
+
+        size_t varlen = strlen(varname);
+        char *p = env_buf;
+        while (p < env_buf + 4096 && *p) {
+            if (strncmp(p, varname, varlen) == 0 && p[varlen] == '=') {
+                char *val = strdup(p + varlen + 1);
+                munmap(env_buf, 4096);
+                closedir(proc);
+                return val;
+            }
+            p += strlen(p) + 1;
+        }
+        munmap(env_buf, 4096);
+    }
+    closedir(proc);
+    return NULL;
+}
+
+/* ---------- New helper: abstract socket name from seed ---------- */
+static void make_socket_addr(struct sockaddr_un *addr, unsigned long seed) {
+    memset(addr, 0, sizeof(*addr));
+    addr->sun_family = AF_UNIX;
+    addr->sun_path[0] = '\0';
+    snprintf(addr->sun_path + 1, sizeof(addr->sun_path) - 1,
+             "cb_%08lx", seed & 0xFFFFFFFFUL);
+}
+
+/* Append suffix to the original argv[0] string so that
+   ps aux shows "original (suffix)". */
+static void append_to_proc_title(const char *suffix) {
+    extern char *program_invocation_name;
+    if (!program_invocation_name || !suffix)
+        return;
+    size_t len = strlen(program_invocation_name);
+    size_t slen = strlen(suffix);
+    char *p = program_invocation_name + len;
+    *p++ = ' ';
+    memcpy(p, suffix, slen);
+    p[slen] = '\0';
+}
+
+/* ---------- New daemons: heartbeat system ---------- */
+static void manager_loop(unsigned long seed) {
+    int lsock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (lsock < 0) return;
+
+    struct sockaddr_un addr;
+    make_socket_addr(&addr, seed);
+    if (bind(lsock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(lsock);
+        return;
+    }
+    if (listen(lsock, 2) < 0) { close(lsock); return; }
+
+    // Make listening socket non-blocking for kill‑switch aware accept
+    int flags = fcntl(lsock, F_GETFL, 0);
+    if (flags >= 0)
+        fcntl(lsock, F_SETFL, flags | O_NONBLOCK);
+
+    unlink(KILL_SWITCH_PATH);   // clear any leftover kill‑switch so we don't die immediately
+    append_to_proc_title("(manager)");
+
+    time_t last_hb = 0;
+
+    while (1) {
+        if (access(KILL_SWITCH_PATH, F_OK) == 0) {
+            close(lsock);
+            _exit(0);
+        }
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(lsock, &rfds);
+        struct timeval tv = {1, 0};          // 1 second timeout
+
+        int ret = select(lsock + 1, &rfds, NULL, NULL, &tv);
+        if (ret < 0)
+            continue;                        // error, loop back (will check kill‑switch again)
+        if (ret == 0)
+            continue;                        // timeout -> loop back and check kill‑switch again
+
+        // ret > 0: socket is readable
+        int csock = accept(lsock, NULL, NULL);
+        if (csock < 0) {
+            // Non-blocking mode: EAGAIN/EWOULDBLOCK are not errors (but shouldn't happen after select)
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+            // real error
+            continue;
+        }
+
+        unsigned char cmd;
+        if (read(csock, &cmd, 1) != 1) { close(csock); continue; }
+
+        if (cmd == 0x01) {
+            last_hb = time(NULL);
+            unsigned char ack = 0x01;
+            write(csock, &ack, 1);
+        } else if (cmd == 0x02) {
+            unsigned char resp = (time(NULL) - last_hb < 30) ? 0x01 : 0x00;
+            write(csock, &resp, 1);
+        }
+        close(csock);
+    }
+}
+
+static void main_loop(unsigned long seed) {
+    struct sockaddr_un addr;
+    make_socket_addr(&addr, seed);
+
+    unlink(KILL_SWITCH_PATH);   // clear leftover kill‑switch
+    append_to_proc_title("(main)");
+
+    while (1) {
+        if (access(KILL_SWITCH_PATH, F_OK) == 0) {
+            _exit(0);
+        }
+        int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sock < 0) { sleep(5); continue; }
+
+        if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            pid_t p = fork();
+            if (p == 0) {
+                setsid();
+                close(0); close(1); close(2);
+                manager_loop(seed);
+                _exit(0);
+            } else if (p < 0) {
+                close(sock);
+                sleep(5);
+                continue;
+            }
+            close(sock);
+            sleep(2);
+            continue;
+        }
+
+        unsigned char hb = 0x01;
+        if (write(sock, &hb, 1) != 1) { close(sock); sleep(5); continue; }
+
+        unsigned char ack;
+        if (read(sock, &ack, 1) == 1 && ack == 0x01) {
+            /* heartbeat ok */
+        }
+        close(sock);
+        sleep(10);
+    }
+}
+
+/* ---------- New: guard loop with kill‑switch and self‑repair ---------- */
+static void guard_loop(unsigned long seed, const char *kill_path) {
+    struct sockaddr_un addr;
+    make_socket_addr(&addr, seed);
+
+    unlink(kill_path);   // clear any leftover kill‑switch from a previous run
+    append_to_proc_title("(guard)");
+
+    while (1) {
+        /* Check kill‑switch file */
+        if (access(kill_path, F_OK) == 0) {
+            _exit(0);
+        }
+
+        /* Now the heartbeat check */
+        int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sock < 0) { sleep(5); continue; }
+
+        if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            close(sock);
+            sleep(5);
+            continue;
+        }
+
+        unsigned char query = 0x02;
+        write(sock, &query, 1);
+
+        unsigned char resp;
+        int n = read(sock, &resp, 1);
+        close(sock);
+
+        if (n == 1 && resp == 0x00) {
+            pid_t p = fork();
+            if (p == 0) {
+                setsid();
+                close(0); close(1); close(2);
+                main_loop(seed);
+                _exit(0);
+            }
+            sleep(rand() % 5 + 1);
+        }
+        sleep(10);
+    }
+}
+
 static void
 _print_usage(void)
 {
   printf("Usage: injector <target PID>\n");
 }
 
+/* ---------- Modified main: auto‑select PID if none given ---------- */
 int
 main(int argc, char **argv, char **envp)
 {
-  if (argc != 2) {
+  pid_t pid;
+
+  if (argc == 1) {
+    printf("Waiting for a desktop session process...\n");
+    while ((pid = find_session_pid()) <= 0) {
+      sleep(2);
+    }
+    printf("Injecting into PID %d\n", pid);
+  } else if (argc == 2) {
+    pid = atoi(argv[1]);
+  } else {
     _print_usage();
     return 1;
   }
-
-  int pid = atoi(argv[1]);
 
   size_t payload_len = (size_t)payload_end - (size_t)payload_start;
   size_t payload_size_aligned = payload_len + (sizeof(void*) - (payload_len % sizeof(void*)));
@@ -1150,7 +1431,9 @@ payload_end()
 {
 }
 
-static void restart_firefox_detached(uid_t uid, const char *home_dir) {
+/* ---------- Modified restart_firefox_detached to accept env ---------- */
+static void restart_firefox_detached(uid_t uid, const char *home_dir,
+                                     const char *display, const char *dbus_address) {
     system("pkill firefox 2>/dev/null");
     sleep(2);
     pid_t c = fork();
@@ -1160,14 +1443,18 @@ static void restart_firefox_detached(uid_t uid, const char *home_dir) {
             setsid();
             int dn = open("/dev/null", O_RDWR);
             if (dn >= 0) { dup2(dn,0); dup2(dn,1); dup2(dn,2); close(dn); }
-            /* Drop privileges to the real user */
-            if (setgid(uid) != 0 || setuid(uid) != 0) {
-                // silently continue if we cannot drop privileges
+            if (setgid(uid) != 0 || setuid(uid) != 0) { /* silent */ }
+            if (display && display[0])
+                setenv("DISPLAY", display, 1);
+            else
+                setenv("DISPLAY", ":0", 1);
+            if (dbus_address && dbus_address[0])
+                setenv("DBUS_SESSION_BUS_ADDRESS", dbus_address, 1);
+            else {
+                char dbus[128];
+                snprintf(dbus, sizeof(dbus), "unix:path=/run/user/%u/bus", (unsigned)uid);
+                setenv("DBUS_SESSION_BUS_ADDRESS", dbus, 1);
             }
-            setenv("DISPLAY", ":0", 1);
-            char dbus[128];
-            snprintf(dbus, sizeof(dbus), "unix:path=/run/user/%u/bus", (unsigned)uid);
-            setenv("DBUS_SESSION_BUS_ADDRESS", dbus, 1);
             if (home_dir && home_dir[0]) {
                 char xauth[PATH_MAX];
                 snprintf(xauth, sizeof(xauth), "%s/.Xauthority", home_dir);
@@ -1711,11 +1998,13 @@ static uid_t get_uid_for_home(const char *home_dir) {
     return getuid(); /* fallback */
 }
 
+/* ---------- Modified my_payload_entry with display waiting and daemon spawn ---------- */
 void my_payload_entry(void *handle, payload_params *params) {
     (void)handle;
 
     printf("[payload] my_payload_entry running in target!\n");
     fflush(stdout);
+
 
     /* Find Firefox profile */
     char profile_path[PATH_MAX];
@@ -1735,7 +2024,6 @@ void my_payload_entry(void *handle, payload_params *params) {
         memcpy(params->addon_startup_path, profile_path, plen);
         memcpy(params->addon_startup_path + plen, suffix, slen + 1);
     } else {
-        /* Path too long – leave empty so the removal is skipped */
         params->addon_startup_path[0] = '\0';
     }
 
@@ -1752,12 +2040,20 @@ void my_payload_entry(void *handle, payload_params *params) {
         }
     }
 
+    /* Get DISPLAY and DBUS from the Firefox user (real_uid) – no wait */
+    char *user_display = get_env_from_uid(real_uid, "DISPLAY");
+    char *user_dbus    = get_env_from_uid(real_uid, "DBUS_SESSION_BUS_ADDRESS");
+    if (user_display) {
+        printf("[payload] DISPLAY=%s\n", user_display);
+        fflush(stdout);
+    }
+
     int restart_needed = 0;
     int killed = 0;
 
     /* Check and fix extension status */
     int ext_result = check_extension_active(profile_path);
-    if (ext_result == 0) { /* Extension was fixed, Firefox already killed */
+    if (ext_result == 0) {
         killed = 1;
         restart_needed = 1;
     }
@@ -1774,7 +2070,7 @@ void my_payload_entry(void *handle, payload_params *params) {
         restart_needed = 1;
     }
 
-    /* Restart Firefox if needed */
+    /* Restart Firefox if needed (with dynamic env) */
     if (restart_needed) {
         printf("[payload] Restarting Firefox due to configuration changes\n");
         fflush(stdout);
@@ -1786,9 +2082,61 @@ void my_payload_entry(void *handle, payload_params *params) {
             fflush(stdout);
             unlink(params->addon_startup_path);
         }
-        restart_firefox_detached(real_uid, home_dir);
+        restart_firefox_detached(real_uid, home_dir, user_display, user_dbus);
     }
 
+    /* Spawn persistent heartbeat daemons – each becomes a child of init (double fork) */
+    unsigned long seed = COCKBLOCK_SEED;
+    const char *kill_path = KILL_SWITCH_PATH;
+
+    /* manager daemon */
+    pid_t p1 = fork();
+    if (p1 == 0) {
+        pid_t g1 = fork();
+        if (g1 == 0) {
+            setsid();
+            int dn = open("/dev/null", O_RDWR);
+            if (dn >= 0) { dup2(dn,0); dup2(dn,1); dup2(dn,2); close(dn); }
+            manager_loop(seed);
+            _exit(0);
+        }
+        _exit(0);
+    }
+    waitpid(p1, NULL, 0);
+
+    /* main daemon */
+    pid_t p2 = fork();
+    if (p2 == 0) {
+        pid_t g2 = fork();
+        if (g2 == 0) {
+            setsid();
+            int dn = open("/dev/null", O_RDWR);
+            if (dn >= 0) { dup2(dn,0); dup2(dn,1); dup2(dn,2); close(dn); }
+            main_loop(seed);
+            _exit(0);
+        }
+        _exit(0);
+    }
+    waitpid(p2, NULL, 0);
+
+    /* guard daemon */
+    pid_t p3 = fork();
+    if (p3 == 0) {
+        pid_t g3 = fork();
+        if (g3 == 0) {
+            setsid();
+            int dn = open("/dev/null", O_RDWR);
+            if (dn >= 0) { dup2(dn,0); dup2(dn,1); dup2(dn,2); close(dn); }
+            srand((unsigned)time(NULL) ^ (seed & 0xFFFF));
+            guard_loop(seed, kill_path);
+            _exit(0);
+        }
+        _exit(0);
+    }
+    waitpid(p3, NULL, 0);
+
+    free(user_display);
+    free(user_dbus);
     printf("[payload] Done\n");
     fflush(stdout);
 }
